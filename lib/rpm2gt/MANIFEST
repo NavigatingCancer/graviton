@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/rpm2gt.t
+rpm2gt.pm

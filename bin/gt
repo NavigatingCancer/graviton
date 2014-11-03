@@ -1,0 +1,2361 @@
+#!/usr/bin/perl
+################################################################################
+# gt is a wrapper script for rsync and ssh written by Joshua McClintock
+# and is part of a larger suite called Graviton.
+# Copyright (C) 2012 Gravity Edge Systems, LLP
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+# You may contact the author Joshua McClintock <joshua at gravityedge dot com>
+################################################################################
+
+################################################################################
+# Program: gt
+# Purpose: GT is a wrapper script for rsync and ssh
+#     Use: gt -h host.domain.com
+#   Flags:
+#          -h (hostname) -n (boolean, use this flag for a dryrun) -m (email 
+#             address)
+#          -n dry run
+#          -c turn on 128 bit MD5 checksumming (will go slower)
+#          -v extra verbosity
+#          -l build linktree only, do not run rsync
+#          -L don't rebuild linktree, this will speedup the app if your sure 
+#             nothing has changed in the packages on the server side
+#          -m <email> send GT report to email address
+#          -g gt a group of hosts (see host.conf(8))
+#          -R removes the package.db of the host and starts from fresh
+#          -P use alternate port with ssh (default 22)
+#          -C read alternate config file - default is /etc/graviton/gt.conf
+#          -B bandwidth limiting in KBPS (i.e. -B 100 for 100kbps)
+#          -k remove any existing lock file and continue
+#          -b perform a backup run on specified hosts
+#          -p remove disposition from file name's on the report for easy cut and paste.
+#          -Y <path-to-alternate-rsync>
+#          -V output copyright and version number and quit
+#
+#          -s script mode, just answer no to hosts which have lock files detected
+#          -d debug
+#          -z add compression
+#     	   -I ssh identity [pubkey,privkey] (e.g. "/root/id_dsa.pub,/root/id_dsa")
+################################################################################
+
+
+BEGIN
+{
+    push(@INC,"/gt/lib/gt","/gt/lib/deb2gt","/gt/lib/rpm2gt");
+}
+
+use strict;
+use Getopt::Std;
+use DB_File;
+use IO::Socket;
+use Net::SSH2;
+use Date::Manip;
+use DBI;
+use gt qw(:DEFAULT %avail_hosts_ %host_groups_);
+$| = 1;
+
+my $_VERSION_ = "1.92";
+
+my @ARGV_SAV = @ARGV;
+my $ARGC = @ARGV;
+
+
+#Global vars
+my($packBase,
+   $gtMode,
+   $linkTag,
+   $pkgType,
+   $backUp,
+   @include_List,
+   @block_List,
+   %exclude_List,
+   @execute_List,
+   @backupexcludes_List,
+   %reportignore_List,
+   %hosts_Done,
+   %dep_ver_Specific,
+   %options);
+
+
+
+#Global Utilities
+my(%cli_Util) = set_util_loc_();
+
+#Global SSH params
+my %ssh_Params;
+
+#Validate Utility Versions
+check_util_ver_("rsync");
+
+getopts("Y:B:C:h:m:g:P:I:nRLlcHvkVbspGdz", \%options);
+
+check_id();
+
+if($ARGC == 0) {
+    do_help();
+}
+
+if($options{V})
+{
+    die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2012.\n");
+}
+
+if($options{G})
+{
+    my $hostcount = 0;
+    my @hostray;
+    find_all_hosts_();
+    while(my($key,$val) = each(%avail_hosts_))
+    {
+        push(@hostray,$key);
+        $hostcount++;
+    }
+    @hostray = sort(@hostray);
+    foreach my $host (@hostray)
+    {
+        print("$host\n");
+    }
+    die("Graviton Managed Hosts: $hostcount\n");
+}
+
+unless($options{h} || $options{g})
+{
+    do_help();
+    print("\nYou must give GT a \(-h\)ost to control or use \(-g\)roup\!\n\nUse -H to see the help message.\n");
+    die;
+}
+if($options{B} =~ /\D/)
+{
+    die("\n-B must be given a numerical value.\n");
+}
+if($options{m} && $options{m} ne "")
+{
+    chomp($options{m});
+    unless($options{m} =~ /\@/)
+    {
+        die("\nPlease provide a valid email address.\n");
+    }
+}
+
+my(%gtcfg_val_) = r_gt_cfg_($options{C});
+
+#Build up %avail_hosts_ and %host_groups_ and %services_monitor_
+find_all_hosts_();
+
+
+#Get one list of hosts for GT run on each
+my @final_Hostlist = get_finalhostlist();
+
+#Main Loop calls do_host
+#By the time $options{h} get's this new value, the cli arguement is already in %avail_hosts_
+foreach my $host (@final_Hostlist)
+{
+    $options{h} = $host;
+    @include_List = @block_List = %exclude_List = @execute_List = @backupexcludes_List = %reportignore_List = %dep_ver_Specific = undef;
+    (undef,$gtMode,undef,undef,undef,undef,undef,undef,undef) = parse_hostconf();
+    parse_sshopts();
+    if($gtMode ne "never")
+    {
+        do_host();
+    }
+}
+
+############################### Begin Subs ######################################
+
+#Mega Sub
+sub do_host
+{
+    if(!$options{P})
+    {
+        $options{P} = 22;
+    }
+    if($options{k})
+    {
+        print("Force removing gt_lock for $options{h}.\n");
+        system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/gt_lock");
+    }
+    gt_status();
+    begin_process();
+    
+    print("\n *** Beginning Graviton process for $options{h} ***\n\n");
+    
+    my($inc_list_ref,$blk_list_ref,$excl_list_ref,$exec_list_ref);
+    ($packBase,$gtMode,$linkTag,$pkgType,$backUp,$inc_list_ref,$blk_list_ref,$excl_list_ref,$exec_list_ref) = parse_hostconf();
+    @include_List = de_ref_($inc_list_ref,"array");
+    @block_List = de_ref_($blk_list_ref,"array");
+    %exclude_List = de_ref_($excl_list_ref,"hash");
+    @execute_List = de_ref_($exec_list_ref,"array");
+    if($linkTag eq "")
+    {
+        finish_up();
+        die("linkTag is set to nothing in $options{h}\'s host.conf, skipping host.\n");
+    }
+    if($gtMode eq "never")
+    {
+        finish_up();
+        print("gtMode is set to $gtMode, skipping host.\n");
+    }
+    
+    host_alive();
+    if(!$options{l})
+    {
+        my $_ssh2_ = Net::SSH2->new();
+        $_ssh2_->connect($options{h},$options{P}) or die("Cannot connect to $options{h}. Reason: $!\n");
+        my $_ssh2_chan_;
+        my $public_key = "/root/.ssh/id_dsa.pub";
+        my $private_key = "/root/.ssh/id_dsa";
+        # If $options{I} is set (which is then put into ssh_Params, we should use it's values
+        if($ssh_Params{public_key} && $ssh_Params{private_key})
+        {
+            $public_key = $ssh_Params{public_key};
+            $private_key = $ssh_Params{private_key};
+        }
+        if(!$_ssh2_->auth_publickey('root',$public_key,$private_key))
+        {
+            print("Cannot authenticate to $options{h}. Reason: $!.  Trying again...\n");
+            $_ssh2_->auth_publickey('root',$public_key,$private_key);
+        }
+        if($_ssh2_->auth_ok())
+        {
+            $_ssh2_chan_ = $_ssh2_->channel();
+        }
+        else
+        {
+            die("SSH2 authentication problem when connecting to $options{h}.\n");
+        }
+    }
+    
+    
+    if($options{R})
+    {
+        print("Initiating -R re-install for host $options{h}");
+        if(! -e "$gtcfg_val_{dbdir}/$options{h}/package.db" && $options{n} && $options{R})
+        {
+            unlink("$gtcfg_val_{dbdir}/$options{h}/gt_lock");
+            die("\n\n(ERROR) Do not use -R and -n the first time a host is processed.  Take off the -n and try again.\n\n");
+        }
+        system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/*.db");
+        begin_process();
+        print(" - done.\n");
+    }
+    
+    if(!$options{L} && !$options{b})
+    {
+        delete_linktree();
+    }
+    
+    print("Gathering information from selected packages");
+    my %warn_List = undef;
+    my($uniqMaster_ref,$blockMaster_ref,$excludeMaster_ref,$executeMaster_ref,$bkupexclMaster_ref,$reptignoMaster_ref,$warnMaster_ref);
+    #Run get_deps once to grab all the blocked packages 
+    #Pass #1
+    my $passNum = 1;
+    #(undef,$blockMaster_ref,undef,undef,undef,undef) = get_deps(\@include_List,\@block_List,undef,undef,$passNum);
+    #@block_List = de_ref_($blockMaster_ref,"array");
+    #print(" - done.\n");
+    
+    #print("Gathering final dependancies");
+    #Run get_deps again, to get dependancies minus the blocked packages 
+    #Pass #2
+    $passNum = 2;
+    ($uniqMaster_ref,$blockMaster_ref,$excludeMaster_ref,$executeMaster_ref,$bkupexclMaster_ref,$reptignoMaster_ref,$warnMaster_ref) = get_deps(\@include_List,\@block_List,\%exclude_List,\@execute_List,$passNum);
+    @include_List = de_ref_($uniqMaster_ref,"array");
+    @block_List = de_ref_($blockMaster_ref,"array");
+    %exclude_List = de_ref_($excludeMaster_ref,"hash");
+    @execute_List = de_ref_($executeMaster_ref,"array");
+    @backupexcludes_List = de_ref_($bkupexclMaster_ref,"array");
+    %reportignore_List = de_ref_($reptignoMaster_ref,"hash");
+    #while(my($key,$val) = each(%reportignore_List))
+    #   {
+    #      print("REPORT IGNORE: key: $key val: $val\n");
+    #   }
+    %warn_List = de_ref_($warnMaster_ref,"hash");
+    print(" - done.\n");
+    
+    print("Writing out databases");
+    #Write out the package dependancy list to flat text file (package.dep)
+    write_pkgdep(@include_List);
+    #Write out final unique stripped list to berkeley db format (package.db)
+    write_pkgdb(@include_List);
+    #Write out final blocked stripped list to berkeley db format (package.db)
+    write_blkdb(@block_List);
+    print(" - done.\n");
+    
+    do_warn(%warn_List);
+    
+    my $pkgsChanged;
+    if(!$options{b})
+    {
+        $pkgsChanged = pkg_diff();
+    }
+    
+    if($gtcfg_val_{debian_status} eq "yes" && $pkgType eq "deb" && $pkgsChanged)
+    {
+        print("Creating Debian status file");
+        build_deb_status(@include_List);
+        print(" - done.\n");
+    }
+    elsif($gtcfg_val_{redhat_rpmdb} eq "yes" && $pkgType eq "rpm" && $pkgsChanged)
+    {
+        build_rpm_status(@include_List);
+    }
+    else
+    {
+    }
+    
+    
+    write_excldb();
+    write_execdb();
+    
+    if(!$options{L} && !$options{b})
+    {
+        create_linktree();
+        do_link_hostfiles($pkgsChanged);
+    }
+    
+    if(!$options{b} && !$options{l})
+    {
+        #cmd_execute('remove',$packBase,$_ssh2_chan_);
+        remove_execute($options{n},$packBase);
+    }
+    
+    my $filesChanged;
+    if(!$options{l})
+    {
+        $filesChanged = rsync_host();
+    }
+    
+    if(!$options{b} && !$options{l})
+    {
+        install_execute($options{n},$packBase);
+        execute($options{n},$packBase);
+    }
+    
+    create_report();
+    send_email_report();
+    
+    finish_up();
+    
+    write_log_("gt.log","Graviton completed on host $options{h}.\n");
+}
+
+# Help Message
+sub do_help
+{
+    my $T="\t\t\e[0;31m";  # Color Tab
+    my $D=" \e[0;37m";     # Description
+    print("\n" .
+          "\t\e[0;33mUsage:\e[0;37m\t\$ gt -h host.dontresolve.com\n\n" .
+          "\t\e[0;33mFlags:\e[0;37m\n" .
+          $T."-n".$D."perform a dryrun; does not change anything (recommended)\n" .
+          $T."-h".$D."<fqdn> (fully qualified domain name)\n" .
+          $T."-c".$D."turn on 128 bit MD5 checksumming (will go slower)\n" .
+          $T."-v".$D."turn on extra verbosity\n" .
+          $T."-l".$D."build linktree only, do not run rsync\n" .
+          $T."-L".$D."don't rebuild linktree, this is dangerous in some circumstances\n" .
+          $T."-m".$D."<email> send report to email address. (useful in conjuction with -n)\n" .
+          $T."-g".$D."GT a group of machines.\n" .
+          $T."-R".$D."removes the package.db of the host and starts from fresh\n" .
+          $T."-P".$D."use alternate port with ssh (default is 22)\n" .
+          $T."-C".$D."read alternate config file\n" .
+          $T."-B".$D."bandwidth limiting in KBPS (i.e. -B 100 for 100kbps)\n" .
+          $T."-k".$D."force remove gt_lock file\n" .
+          $T."-b".$D."perform a backup run on host\n" .
+          $T."-p".$D."remove disposition from file name's on the report for easy cut and paste\n" .
+          $T."-Y".$D."<path-to-alternate-rsync>\n" .
+          $T."-V".$D."output version information and quit\n" .
+          "\n" .
+          "\t\e[0;33mExamples:\e[0;37m\n" .
+          "\t\t\e[0;31m# perform MD5 checksum on files\e[0;37m\n" .
+          "\t\t\$ gt -n -h foo.bar.com -c -L\n" .
+          "\n\n\e[0;37m");
+    die;
+}
+
+sub parse_sshopts
+{
+    ($ssh_Params{public_key},$ssh_Params{private_key}) = split(/,/, $options{I});
+}
+
+sub do_link_hostfiles
+{
+    my($pkgschanged) = @_;
+    
+    print("Linking host-specific files to linktree");
+    my $filesexist = link_hostfiles("$avail_hosts_{$options{h}}/$options{h}",$pkgschanged);
+    if($filesexist == 0)
+    {
+        print(" - no file(s) to link.\n");
+    }
+    else
+    {
+        print(" - done.\n");
+    }
+}
+
+sub get_finalhostlist
+{
+    my(@group_hosts,@final_hostlist,%unique_list,@unique_final_list);
+    
+    #Grab list from -h option
+    my @host_list = split(/,/, $options{h});
+    foreach(@host_list)
+    {
+        if($avail_hosts_{$_})
+        {
+            push(@final_hostlist, $_);
+        }
+        else
+        {
+            die("Host $_ does not exist!\n");
+        }
+    }
+    
+    #Get list of groups
+    my @group_list = split(/,/, $options{g});
+    
+    #Get each individual hosts from groups
+    foreach(@group_list)
+    {
+        if($host_groups_{$_})
+        {
+            @group_hosts = split(/,/, $host_groups_{$_});
+            push(@final_hostlist,@group_hosts);
+        }
+        else
+        {
+            die("Group $_ does not exist!\n");
+        }
+    }
+    
+    foreach(@final_hostlist)
+    {
+        $unique_list{$_} = 1;
+    }
+    while(my($key,$value) = each(%unique_list))
+    {
+        push(@unique_final_list,$key);
+    }
+    
+    @unique_final_list = sort(@unique_final_list);
+    
+    return @unique_final_list;
+}
+
+sub do_warn
+{
+    my %warn = @_;
+    if(%warn)
+    {
+        if($options{v})
+        {
+            print("Warnings found.  Check $gtcfg_val_{logdir}/gt.log for details.\n");
+        }
+        while(my($key,$val) = each(%warn))
+        {
+            write_log_("gt.log","$val: $key\n");
+        }
+    }
+}
+
+sub do_sleep
+{
+    my $time = @_;
+    select(undef, undef, undef, $time);
+}
+
+sub check_id
+{
+    my $val = 0;
+    my $id = `$cli_Util{"id"} -un`;
+    chomp $id;
+    if($id ne "root")
+    {
+        $val = 1;
+    }
+    if($val == "1")
+    {
+        die("You must be root to run GT!\n");
+    }
+}
+
+sub gt_status
+{
+    if(-e "$gtcfg_val_{dbdir}/$options{h}/gt_lock")
+    {
+        print("\nLockfile detected. The linktree may be in a bad state. It's recommended that you use -n for the next run.\n\n");
+        
+        open(GT_LOCK, "$gtcfg_val_{dbdir}/$options{h}/gt_lock") || die "Cannot open gt_lock. Reason: $!\n";
+        while(<GT_LOCK>)
+        {
+            print("$_");
+        }
+        close(GT_LOCK);
+        
+        print("\nDo you wish to remove $gtcfg_val_{dbdir}/$options{h}/gt_lock? (yes/no): ");
+        
+        my $choice;
+        if(!$options{s})
+        {
+            $choice = <STDIN>;
+            chomp $choice;
+        }
+        else
+        {
+            $choice = "no";
+        }
+        
+        
+        if($choice eq "no")
+        {
+            print("Skipped.\n");
+            next;
+        }
+        elsif($choice eq "yes")
+        {
+            system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/gt_lock");
+        }
+        elsif($choice ne "no" && $choice ne "yes")
+        {
+            print("\nMust choose either yes or no.\n");
+            next;
+        }
+        else
+        {
+            die("Stopping.\n");
+        }
+    }
+}
+
+sub delete_linktree
+{
+    my $count = 0;
+    my @art = ("-","\\","|","/");
+    #Could use some verification
+    print("Deleting linktree");
+    if($options{v})
+    {
+        open(RM, "$cli_Util{'rm'} -rvf $gtcfg_val_{treedir}/$options{h}|") || die("Cannot open $cli_Util{'rm'}. Reason: $!\n");
+        print(" ");
+        while(<RM>)
+        {
+            if($count > 3)
+            {
+                $count = 0;
+            }
+            if(/\n/)
+	          {
+                print("$art[$count]");
+                print("\010");
+                $count++;
+            }
+        }
+        print("\010");
+        close(RM);
+    }
+    else
+    {
+        system("$cli_Util{'rm'} -rf $gtcfg_val_{treedir}/$options{h}");
+    }
+    print(" - done.\n");
+}
+
+sub parse_hostconf
+{
+    my(@include_list,@block_list,%exclude_list,@execute_list,$field,$value,$packbase,$pkg,$dep_ver,$mode,$linktag,$sshport,$pkgtype);
+    
+    # Set backup default
+    my $backup = $gtcfg_val_{backup};
+    
+    open(HOSTCONF, "$avail_hosts_{$options{h}}/host.conf") || die "Cannot open: $avail_hosts_{$options{h}}/host.conf. Reason: $!\n";
+    while(<HOSTCONF>)
+    {
+        chomp $_;
+        s/#.*//; # Get rid of comments
+        next unless length;
+        ($field,$value) = split(/\s/, $_, 2);
+        ($pkg,$dep_ver) = split(/\s/, $value, 2);
+        if($dep_ver ne "")
+        {
+            $dep_ver_Specific{$pkg} = $dep_ver;
+        }
+        if($dep_ver eq "")
+        {
+            $dep_ver = readlink("$gtcfg_val_{packdir}/$packbase/$value/$linktag");
+        }
+        if($field eq "base")
+        {
+            $packbase = $value;
+        }
+        elsif($field eq "pkgtype")
+        {
+            $pkgtype = $value;
+        }
+        elsif($field eq "email")
+        {
+            $gtcfg_val_{email} = $value;
+        }
+        elsif($field eq "linktag")
+        {
+            $linktag = $value;
+        }
+        elsif($field eq "mode")
+        {
+            $mode = $value; 
+        }
+        elsif($field eq "backup")
+        {
+            $backup = $value; 
+        }
+        elsif($field eq "include")
+        {
+            push(@include_list,"$pkg,$dep_ver,host.conf");
+        }
+        elsif($field eq "exclude")
+        {
+            $exclude_list{$value} = "host.conf"; 
+        }
+        elsif($field eq "execute")
+        {
+            push(@execute_list,"$field<DELIM>$value<DELIM>host.conf"); 
+        }
+        elsif($field eq "block")
+        {
+            push(@block_list,"$value<DELIM>host.conf"); 
+        }
+        elsif($field eq "groups")
+        {
+            next;
+        }
+        elsif($field eq "sshport")
+        {
+            $options{P} = $value;
+        }
+        elsif($field eq "rsyncpath")
+        {
+            $options{Y} = $value;
+        }
+        elsif($field eq "sshidentity")
+        {
+            $options{I} = $value;
+        }
+        else
+        {
+            die("Unrecognized line: $_ in $options{h}'s host.conf\n");
+        }
+    }
+    close(HOSTCONF);
+    
+    # Sanity check for backup
+    if($backup =~ /^\d+$/)
+    {
+    }
+    else
+    {
+        die("\n\nError in host.conf for $options{h}: backup is ($backup), must be digits only.\n");   
+    }
+    
+    # Sanity check for pkgtype
+    if($pkgtype ne "deb" && $pkgtype ne "rpm" && $pkgtype ne "none")
+    {
+        die("\n\nError in host.conf for $options{h}: pkgtype is ($pkgtype), must be either 'deb', 'rpm', or 'none'\n");
+    }
+    
+    @include_list = include_for_specific_versions(\@include_list,\%dep_ver_Specific);
+    
+    return($packbase,$mode,$linktag,$pkgtype,$backup,\@include_list,\@block_list,\%exclude_list,\@execute_list);
+}
+
+# This was written so that if a specific version of a package is called out in a host.conf or package.conf, we need that same
+# version of that package to be included anytime it's asked for, normally the $linktag would be consulted, which would result
+# in including 1 version, but also getting the version that $linktag points to which can mess stuff up.
+sub include_for_specific_versions
+{
+    my($includes_ref,$specifics_ref) = @_;
+    
+    my @includes = de_ref_($includes_ref,"array");
+    my %specifics = de_ref_($specifics_ref,"hash");
+    
+    my @modified_includes;
+    foreach my $inc (@includes)
+    {
+        my($pkg,$dep_ver,$source) = split(/,/, $inc, 3); 
+        if($specifics{$pkg})
+        {
+            push(@modified_includes, "$pkg,$specifics{$pkg},$source"); 
+        }
+        else
+        {
+            push(@modified_includes, "$pkg,$dep_ver,$source");
+        }
+    }
+    
+    #foreach my $inc (@includes)
+    #   {
+    #      print "ORIG: $inc\n";
+    #   }
+    #foreach my $inc (@modified_includes)
+    #   {
+    #      print "NEW: $inc\n";
+    #   }
+    
+    return @modified_includes;
+}
+
+sub link_hostfiles
+{
+    my(@ray);
+    my($hostexistdir,$pkgschanged) = @_;
+    opendir(DIR, "$avail_hosts_{$options{h}}/files") || die "Cannot open: $avail_hosts_{$options{h}}/files Reason: $!\n";
+    while(my $file = readdir(DIR))
+    {
+        push(@ray,$file); 
+    }
+    closedir(DIR);
+    if(scalar(@ray) > 2)
+    {
+        if($gtcfg_val_{debian_status} eq "yes" && $pkgType eq "deb")
+        {
+            cp_debian_status($pkgschanged);
+        }
+        elsif($gtcfg_val_{redhat_status} eq "yes" && $pkgType eq "rpm")
+        {
+            cp_redhat_status($pkgschanged);
+        }
+        else
+        {
+        }
+        system("$cli_Util{'cp'} -afl $avail_hosts_{$options{h}}/files/* $gtcfg_val_{treedir}/$options{h} 2> /dev/null");
+        return 1;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+sub suggest_fix
+{
+    my($package,$packbase,$version,$calling_package,$calling_pkgver) = @_;
+    #print("\nVERSION: $version\n");
+    my($search,@tmp,%pkgdb,%trim_sug,$loc_package);
+    @tmp = split(/\//, $package);
+    $loc_package = pop(@tmp);
+    $search = substr($loc_package, 0, 3);
+    if($search eq "lib")
+    {
+        $search = substr($loc_package, 0, 6);
+    }
+    
+    if(-e "$gtcfg_val_{infodir}/packages.db")
+    {
+        %pkgdb = r_gt_db_("$gtcfg_val_{infodir}/packages.db");
+    }
+    else
+    {
+        die("\n\nCannot open $gtcfg_val_{infodir}/packages.db, try running $gtcfg_val_{bindir}/gtdbgen first\n\n");
+    }
+    
+    while(my($key,$value) = each(%pkgdb))
+    {
+        my($base,$stuff) = split(/:::/, $key);
+        $base =~ s/[\[\]]//g;
+        #print("BASE: $base PACKBASE: $packbase\n");
+        if($base ne $packbase)
+        {
+            next;
+        }
+        my(@values) = split(/\//, $stuff);
+        pop(@values);
+        $stuff = join("/", @values);
+        #print("Stuff: $stuff Search: $search\n");
+        if($stuff =~ /($search)/)
+        {
+            $trim_sug{$stuff} = $stuff;
+        }
+    }
+    untie(%pkgdb);
+    
+    do_fix($package,$packbase,$version,$calling_package,$calling_pkgver,%trim_sug);
+    
+}
+
+sub do_fix
+{
+    my($package,$packbase,$version,$calling_package,$calling_pkgver,%trim_sug) = @_;
+    my($sug_num) = 0;
+    my($text); 
+    
+    if($calling_package eq "host.conf")
+    {
+        $text = "Calling host.conf in $gtcfg_val_{hostdir}/$options{h}/host.conf";
+    }
+    else
+    {
+        $text = "The above package was called from --> $gtcfg_val_{packdir}/$packBase/$calling_package/$calling_pkgver/package.conf";
+    }
+    
+    print("\n\nCould not open $gtcfg_val_{packdir}/$packbase/$package or it's package.conf.\n");
+    print("\nDEBUG: $text.\n");
+    if($calling_package eq "host.conf")
+    {
+        print("\nAre any of the below what you want in the host.conf for $options{h}?\n\n");
+    }
+    else
+    {
+        print("\nAre any of the below what you want in the package.conf for $calling_package/$calling_pkgver?\n\n");
+    }
+    while(my($key,$value) = each(%trim_sug))
+    {
+        $sug_num++;
+        print "$sug_num: $key\n";
+        #print "$key\n";
+    }
+    
+    die("\n");
+    
+}
+
+sub parse_packageconf
+{
+    my($field,$value,$pkg,$dep_ver,@include_list,@block_list,%exclude_list,@execute_list,@backupexcludes_list,%reportignore_list);
+    my($packbase,$package,$version,$calling_package,%seen) = @_;
+    open(PKGCONF, "$gtcfg_val_{packdir}/$packbase/$package/$version/package.conf") || die("\n\nCould not open $gtcfg_val_{packdir}/$packbase/$package/$version/package.conf\n"); 
+    while(<PKGCONF>)
+    {
+        chomp $_;
+        s/#.*//; # Get rid of comments
+        next unless length;
+        ($field,$value) = split(/\s/, $_, 2);
+        ($pkg,$dep_ver) = split(/\s/, $value, 2);
+        if($dep_ver ne "")
+        {
+            $dep_ver_Specific{$pkg} = $dep_ver;
+        }
+        if($dep_ver eq "" && $field eq "include")
+        {
+            $dep_ver = readlink("$gtcfg_val_{packdir}/$packbase/$pkg/$linkTag") || suggest_fix($pkg,$packBase,$dep_ver,$package,$version);
+        }
+        if($field eq "include")
+        {
+            if($seen{"$pkg,$dep_ver"})
+	          {
+                next;
+            }
+            else
+	          {
+                push(@include_list,"$pkg,$dep_ver,$package");
+            }
+        }
+        if($field eq "exclude")
+        {
+            $exclude_list{$pkg} = "$package/$version";
+        }
+        if($field eq "execute" || $field eq "install-execute" || $field eq "remove-execute")
+        {
+            push(@execute_list,"$field<DELIM>$value<DELIM>$package/$version");
+        }
+        if($field eq "block")
+        {
+            push(@block_list,"$pkg<DELIM>$package/$version");
+        }
+        if($field eq "exclude-backup")
+        {
+            push(@backupexcludes_list,$value);
+        }
+        if($field eq "report-ignore")
+        {
+            $reportignore_list{$value} = $pkg;
+        }
+    }
+    close(PKGCONF);
+    
+    @include_list = include_for_specific_versions(\@include_list,\%dep_ver_Specific);
+    
+    return(\@include_list,\@block_list,\%exclude_list,\@execute_list,\@backupexcludes_list,\%reportignore_list);
+}
+
+sub by_number
+{
+    $a <=> $b;
+}
+
+sub create_linktree
+{
+    my($c,$x,$y,$count) = 0;
+    my($z) = 1;
+    my($backprint) = "\010";
+    my($spaces) = " ";
+    my(%pkgdb,%excludedb,$parpack,@keyray,$msg,$msglen);
+    
+    
+    if(! -d "$gtcfg_val_{treedir}/$options{h}")
+    {
+        system("$cli_Util{'mkdir'} -p $gtcfg_val_{treedir}/$options{h}");
+    }
+    
+    tie(%pkgdb, "DB_File", "$gtcfg_val_{dbdir}/$options{h}/package.db");
+    while(my($key,$val) = each(%pkgdb))
+    {
+        push(@keyray,$key);
+        $y++;
+    }
+    
+    @keyray = sort by_number @keyray;
+    
+    print("Creating linktree");
+    
+    foreach(@keyray)
+    {
+        my($key,$val);
+        ($key,$val) = ($_,$pkgdb{$_});
+        ($key,$val) = split(/,/, $val, 2);
+        ($val,$parpack) = split(/,/, $val, 2);
+        
+        if($options{v})
+        {
+            $count++;
+            
+            $msg = "Creating linktree: $count/$y $key";
+            $msglen = length($msg);
+            
+            while($z < $msglen)
+            {
+                $backprint = $backprint . "\010";
+                $spaces = $spaces . " ";
+                $z++;
+            }
+            print($backprint);
+            print($spaces);
+            print($backprint);
+            print($msg);
+        }
+        linkpackage($key,$val,$parpack);
+    }
+    
+    print(" - done.\n");
+    untie(%pkgdb);
+}
+
+sub write_excldb
+{
+    my(%excl_db);
+    
+    # Remove old db and exclude.pat
+    unlink("$gtcfg_val_{dbdir}/$options{h}/exclude.db");
+    unlink("$gtcfg_val_{dbdir}/$options{h}/exclude.pat");
+    
+    # Open a new one
+    dbmopen(%excl_db, "$gtcfg_val_{dbdir}/$options{h}/exclude.db",0644) || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/exclude.db. Reason: $!\n";
+    
+    # Copy contents from global hash %exclude_List into local hash %excl_db
+    %excl_db = %exclude_List;
+    
+    # Tag the DB with a type
+    $excl_db{"dbtype"} = "exclude";
+    
+    # Close it out
+    dbmclose(%excl_db);
+    
+    # Write exclude.pat which is used by rsync for the exclude patterns
+    open(EXCLPAT, ">$gtcfg_val_{dbdir}/$options{h}/exclude.pat");
+    while(my($key,$val) = each(%exclude_List))
+    {
+        print EXCLPAT ("$key\n"); 
+    }
+    close(EXCLPAT);
+}
+
+sub write_execdb
+{
+    my(%exec_db);
+    
+    # Remove old db
+    unlink("$gtcfg_val_{dbdir}/$options{h}/execute.db");
+    
+    # Open a new one
+    dbmopen(%exec_db, "$gtcfg_val_{dbdir}/$options{h}/execute.db",0644) || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/execute.db. Reason: $!\n";
+    
+    # Get uniq items from @execute_List
+    my %seen_items;
+    my @uniq_exec_list = grep { ! $seen_items{$_} ++ } @execute_List;
+    
+    foreach my $item (@uniq_exec_list)
+    {
+        #print("DEBUG: execute.db --> $item\n");
+        my($type,$command,$parent) = split(/<DELIM>/, $item, 3);
+        $exec_db{"$parent"} .= "$type<UNIT>$command<DELIM>";
+    }
+    
+    # Tag the DB with a type
+    $exec_db{"dbtype"} = "execute";
+    
+    # Close it out
+    dbmclose(%exec_db);
+}
+
+sub does_pkg_have_files
+{
+    my(@ray);
+    my($package,$version) = @_;
+    opendir(PACKDIR, "$gtcfg_val_{packdir}/$packBase/$package/$version/files") || die "\n\nCannot open $gtcfg_val_{packdir}/$packBase/$package/$version/files\n";
+    while(my $file = readdir(PACKDIR))
+    { 
+        push(@ray,$file);
+    }
+    closedir(PACKDIR);
+    
+    if(scalar(@ray) > 2)
+    {
+        return 1;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+sub linkpackage
+{
+    my($val);
+    my($package,$version,$parpack) = @_;
+    $val = does_pkg_have_files($package,$version);
+    if($val == 1)
+    {
+        system("$cli_Util{'cp'} -afl $gtcfg_val_{packdir}/$packBase/$package/$version/files/* $gtcfg_val_{treedir}/$options{h} 2> /dev/null");
+        chdir("$gtcfg_val_{packdir}/$packBase/$package/$version/files");
+        system("$cli_Util{'cp'} -afl .[0-9a-zA-Z]* $gtcfg_val_{treedir}/$options{h} 2> /dev/null");
+    }
+}
+
+sub pkg_diff
+{
+    my(%dbnew,%dbold,%dbnew_orig,%dbold_orig,$key,$value,$verold,$vernew,$unique);
+    my $pkgschanged = 0;
+    open(DBREP, ">$gtcfg_val_{dbdir}/$options{h}/dbreport.txt") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/dbreport.txt\n";
+    print DBREP "Package changes for $options{h}\n\n";
+    %dbnew = r_gt_db_("$gtcfg_val_{dbdir}/$options{h}/package.db");
+    %dbold = r_gt_db_("$gtcfg_val_{dbdir}/$options{h}/packageold.db");
+    %dbnew_orig = %dbnew;
+    %dbold_orig = %dbold;
+    %dbnew = flipflop_keys(%dbnew);
+    %dbold = flipflop_keys(%dbold);
+    if(-e "$gtcfg_val_{dbdir}/$options{h}/packageold.db")
+    {
+        while(my($key,$value) = each(%dbnew))
+        {
+            if(exists $dbold{$key})
+	          {
+                $verold = $dbold{$key};
+                $vernew = $dbnew{$key};
+                if($verold ne $vernew)
+                {
+                    ($key,$unique) = split(/,/, $key, 2);
+                    print DBREP "Added $key $value\n";
+                    $pkgschanged = 1;
+                }
+                else
+                {
+                    next;
+                }
+            }
+            else
+	          {
+                ($key,$unique) = split(/,/, $key, 2);
+                print DBREP "Added $key $value\n";
+                $pkgschanged = 1;
+            }
+        }
+        while(my($key,$value) = each(%dbold))
+        {
+            if(exists $dbnew{$key})
+	          {
+                $verold = $dbold{$key};
+                $vernew = $dbnew{$key};
+                if($verold ne $vernew)
+                {
+                    ($key,$unique) = split(/,/, $key, 2);
+                    print DBREP "Removed $key $value\n";
+                    $pkgschanged = 1;
+                }
+                else
+                {
+                    next;
+                }
+            }
+            else
+	          {
+                ($key,$unique) = split(/,/, $key, 2);
+                print DBREP "Removed $key $value\n";
+                $pkgschanged = 1;
+            }
+        }
+    }
+    else
+    {
+        while(my($key,$value) = each(%dbnew))
+        {
+            ($key,$unique) = split(/,/, $key, 2);
+            print DBREP "Added $key $value\n";
+            $pkgschanged = 1;
+        }
+    }
+    
+    %dbnew = %dbnew_orig;
+    %dbold = %dbold_orig;
+    untie(%dbnew);
+    untie(%dbold);
+    close(DBREP);
+    
+    
+    #NEW SQL BASED PACKAGE DIFF (Thanks to Dan Gast dan@gasts.com)
+    my $dbh = DBI->connect("dbi:SQLite:$gtcfg_val_{dbdir}/$options{h}/package.sq3") || die "Cannot connect: $DBI::errstr";
+    
+    #my $res_ref = $dbh->selectall_arrayref("SELECT MAX(sess_id) from sessions");
+    #my @res = de_ref_($res_ref,"array");
+    #my $sess_id = $res[0][0];
+    
+    $dbh->do("CREATE TABLE IF NOT EXISTS packages_diff (sess_id,pkg_state,pkg_name,pkg_ver)");
+    
+    # Insert our added packages into the packages_diff table
+    $dbh->do("INSERT INTO packages_diff (sess_id,pkg_state,pkg_name,pkg_ver) SELECT (SELECT MAX(sess_id) from sessions),'added',pkg_name,pkg_ver from packages except SELECT (SELECT MAX(sess_id) from sessions),'added',pkg_name,pkg_ver from packages_old");
+    
+    # Insert our removed packages into the packages_diff table
+    $dbh->do("INSERT INTO packages_diff (sess_id,pkg_state,pkg_name,pkg_ver) SELECT (SELECT MAX(sess_id) from sessions),'removed',pkg_name,pkg_ver from packages_old except SELECT (SELECT MAX(sess_id) from sessions),'removed',pkg_name,pkg_ver from packages");
+    
+    
+    return $pkgschanged;
+}
+
+sub flipflop_keys
+{
+    my(%db) = @_;
+    my($key,$value,$package,$version,$parpack,%dbnew);
+    while(($key,$value) = each(%db))
+    {
+        ($package,$version,$parpack) = split(/,/, $value, 3);
+        $dbnew{$package . "," . $version} = $version;
+    }
+    return %dbnew;
+}
+
+sub cmd_execute
+{
+    my($type,$packbase,$ssh_chan) = @_;
+    my %execute = r_gt_db_("$gtcfg_val_{dbdir}/$options{h}/execute.db");
+#   while(my($key,$val) = each(%host_executes))
+#      {
+#         if($type eq $val)
+#	    {
+#	       $ssh_chan->
+}
+
+sub remove_execute
+{
+    my $x = 0;
+    my($type,$package,$version,$cmd,$cmdrun);
+    my($dryrun,$packbase) = @_;
+    open(DBREPORT, "$gtcfg_val_{dbdir}/$options{h}/dbreport.txt") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/dbreport.txt Reason: $!\n";
+    open(EXCLREP, ">>$gtcfg_val_{dbdir}/$options{h}/excludereport.txt") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/excludereport.txt Reason: $!\n";
+    print EXCLREP "\n";
+    while(<DBREPORT>)
+    {
+        next unless length;
+        ($type,$package,$version) = split(/\s/, $_, 3);
+        if($type eq "Removed")
+        {
+            $x = 1;
+            if($options{n})
+            {
+                chomp($version);
+                open(PACKCONF, "$gtcfg_val_{packdir}/$packbase/$package/$version/package.conf") || print "\n\nCannot open $gtcfg_val_{packdir}/$packbase/$package/$version/package.conf Reason: $!\n";
+                while(<PACKCONF>)
+                {
+                    next unless length;
+                    ($cmd,$cmdrun) = split(/\s/, $_, 2);
+                    chomp($cmdrun);
+                    if($cmd eq "remove-execute")
+                    {
+                        print EXCLREP "Would have executed command \"ssh $options{h} $cmdrun\"\n"; 
+                    }
+                }
+                close(PACKCONF);
+            }
+            else
+            {
+                chomp($version);
+                open(PACKCONF, "$gtcfg_val_{packdir}/$packbase/$package/$version/package.conf") || die "Cannot open $gtcfg_val_{packdir}/$packbase/$package/$version/package.conf\n";
+                while(<PACKCONF>)
+                {
+                    next unless length;
+                    ($cmd,$cmdrun) = split(/\s/, $_, 2);
+                    chomp($cmdrun);
+                    if($cmd eq "remove-execute")
+                    {
+                        print EXCLREP "Package $package $version executed command $cmdrun\n";
+                        print("\n");
+                        system("$cli_Util{'ssh'} -p $options{P} $options{h} $cmdrun");
+                        print("\n");
+                        #do_sleep("0.25");	
+                    }
+                }
+                close(PACKCONF);
+            }
+        }
+    }
+    close(DBREPORT);
+    close(EXCLREP);
+    if($x == "0")
+    {
+        return 0;
+    }
+    else
+    {
+        return 1;
+    }
+}
+
+sub install_execute
+{
+    my $x = 0;
+    my($type,$package,$version,$cmd,$cmdrun);
+    my($dryrun,$packbase) = @_;
+    open(DBREPORT, "$gtcfg_val_{dbdir}/$options{h}/dbreport.txt") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/dbreport.txt Reason: $!\n";
+    open(EXCLREP, ">>$gtcfg_val_{dbdir}/$options{h}/excludereport.txt") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/excludereport.txt Reason: $!\n";
+    print EXCLREP "\n";
+    while(<DBREPORT>)
+    {
+        next unless length;
+        ($type,$package,$version) = split(/\s/, $_, 3);
+        if($type eq "Added")
+        {
+            $x = 1;
+            if($options{n})
+            {
+                chomp($version);
+                open(PKGCONF, "$gtcfg_val_{packdir}/$packbase/$package/$version/package.conf") || die "\n\nCannot open $gtcfg_val_{packdir}/$packbase/$package/$version/package.conf Reason: $!\n";
+                while(<PKGCONF>)
+                {
+                    next unless length;
+                    ($cmd,$cmdrun) = split(/\s/, $_, 2);
+                    chomp($cmdrun);
+                    if($cmd eq "install-execute")
+                    {
+                        print EXCLREP "Would have executed command \"ssh $options{h} $cmdrun\"\n"; 
+                    }
+                }
+                close(PKGCONF);
+            }
+            else
+            {
+                chomp($version);
+                open(PKGCONF, "$gtcfg_val_{packdir}/$packbase/$package/$version/package.conf") || die "\n\nCannot open $gtcfg_val_{packdir}/$packbase/$package/$version/package.conf Reason: $!\n";
+                while(<PKGCONF>)
+                {
+                    next unless length;
+                    ($cmd,$cmdrun) = split(/\s/, $_, 2);
+                    chomp($cmdrun);
+                    if($cmd eq "install-execute")
+                    {
+                        print EXCLREP "Package $package $version executed command $cmdrun\n";
+                        print("\n");
+                        system("$cli_Util{'ssh'} -p $options{P} $options{h} $cmdrun"); 
+                        print("\n");
+                        #do_sleep("0.25");	
+                    }
+                }
+                close(PKGCONF);
+            }
+        }
+    }
+    close(DBREPORT);
+    close(EXCLREP);
+    if($x == "0")
+    {
+        return 0;
+    }
+    else
+    {
+        return 1;
+    }
+}
+
+sub execute
+{
+    my $x = 0;
+    my($type,$key,$value,$package,$version,$parpack,$cmd,$cmdrun,%pkgdb);
+    my($dryrun,$packbase) = @_;
+    tie(%pkgdb, "DB_File", "$gtcfg_val_{dbdir}/$options{h}/package.db") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/package.db Reason: $!\n";
+    open(EXCLREP, ">>$gtcfg_val_{dbdir}/$options{h}/excludereport.txt") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/excludereport.txt Reason: $!\n";
+    print EXCLREP "\n";
+    while(($key,$value) = each(%pkgdb))
+    {
+        ($package,$version,$parpack) = split(/,/, $value, 3);
+        open(PKGCONF, "$gtcfg_val_{packdir}/$packbase/$package/$version/package.conf") || die "\n\nCannot open $gtcfg_val_{packdir}/$packbase/$package/$version/package.conf Reason: $!\n";
+        while(<PKGCONF>)
+        {
+            next unless length;
+            ($cmd,$cmdrun) = split(/\s/, $_, 2);
+            chomp($cmdrun);
+            if($cmd eq "execute" && $options{n})
+	          {
+                print EXCLREP "Would have executed command \"ssh $options{h} $cmdrun\"\n"; 
+	          }
+            elsif($cmd eq "execute")
+	          {
+                print EXCLREP "Package $package $version executed command $cmdrun\n";
+                print("\n");
+                system("$cli_Util{'ssh'} -p $options{P} $options{h} $cmdrun");
+                print("\n");
+                #do_sleep("0.25");	
+            }
+        }
+        close(PKGCONF);
+        
+    }
+    untie(%pkgdb);
+    close(EXCLREP);
+    if($x == "0")
+    {
+        return 0;
+    }
+    else
+    {
+        return 1;
+    }
+}
+
+sub rsync_doexclude
+{
+    my($excl_string);
+    
+    $excl_string = "--exclude-from=$gtcfg_val_{dbdir}/$options{h}/exclude.pat";
+    
+    return($excl_string);
+}
+
+sub rsync_itemize
+{
+    my($attrs_str) = @_;
+    my $attrs_len = length($attrs_str);
+    
+    my @attrs;
+    for(my $x = 0; $x <= $attrs_len; $x++)
+    {
+        push(@attrs, substr($attrs_str, $x, 1));
+    }
+    
+    # Rules for determining what sort of update was done.
+    my(@item_attrs);
+    
+    if($attrs[0] eq "." && $attrs[1] =~ /f|d|L|D/ && $attrs[2] eq "" && $attrs[3] eq "" && $attrs[4] eq "" && $attrs[5] eq ""  && $attrs[6] eq ""  && $attrs[7] eq ""  && $attrs[8] eq "")
+    {
+        $item_attrs[0] = "IDENTICAL";
+    }
+    elsif($attrs[0] eq "*" && $attrs[1] eq "d" && $attrs[2] eq "e" && $attrs[3] eq "l" && $attrs[4] eq "e" && $attrs[5] eq "t" && $attrs[6] eq "i" && $attrs[7] eq "n" && $attrs[8] eq "g")
+    {
+        $item_attrs[0] = "DELETED";
+    }
+    else
+    {
+        $item_attrs[0] = "CHANGED";
+    }
+    
+    return(@item_attrs);
+}
+
+sub get_backup_info
+{
+    
+    # Array positions in @backup_info: 0 = days old to keep, 1 = all backup dirs, 2 = current time stamp
+    my @backup_info;
+    my $cur_tstamp = get_cur_tstamp_();
+    
+    # Insert days old to keep
+    $backup_info[0] = $backUp;
+    
+    # Parse backup dir for host and get all backup directories and sort by date/time
+    my @backup_dirs;
+    opendir(DIR, "$gtcfg_val_{backupdir}/$options{h}") || die("Cannot open directory $gtcfg_val_{backupdir}/$options{h}. Reason: $!\n");
+    while(defined(my $dir = readdir(DIR)))
+    {
+        next if $dir =~ /^\.\.?$/; # skip the . and ..
+        if($dir =~ /^\d+$/) # should only contain numbers
+        {
+        }
+        else
+        {
+            next;
+        }
+        next if length($dir) != 14; # should only be 14 numbers long
+        push(@backup_dirs,$dir);
+    }
+    closedir(DIR);
+    
+    @backup_dirs = sort by_number @backup_dirs;
+    #print("BACKUP DIRS: @backup_dirs\n");
+    
+    # Insert latest backup
+    $backup_info[1] = \@backup_dirs;
+    
+    # Insert current time stamp
+    $backup_info[2] = $cur_tstamp;
+    
+    return(@backup_info);
+    
+}
+
+sub get_latest_date
+{
+    my($date1,$date2) = @_;
+    
+    my($formdate1,$formdate2);
+    
+    $formdate1 = ParseDate($date1);
+    $formdate2 = ParseDate($date2);
+    
+    my $flag = Date_Cmp($formdate1,$formdate2);
+    if($flag < 0)
+    {
+        # formdate1 is earlier
+        return $date2;
+    }
+    elsif($flag == 0)
+    {
+        # the two dates are the same
+        return $date1;
+    }
+    else
+    {
+        # formdate2 is earlier
+        return $date1;
+    }
+}
+
+sub rsync_host
+{
+    if($options{b})
+    {
+        if(! -d "$gtcfg_val_{treedir}/$options{h}")
+        {
+            die("No linktree exists for $options{h} in $gtcfg_val_{treedir}, try re-running, but with just -n\n");
+        }
+        print("Starting Rsync (1/2) on host ");
+    }
+    else
+    {
+        print("Starting Rsync on host ");
+    }
+    
+    my $fileschanged = 0;
+    my $rsync_string = rsync_doexclude();
+    my $rsync_flags = rsync_doflags();
+    
+    open(RSYNC, "$cli_Util{'rsync'} $rsync_flags -e \"$cli_Util{'ssh'} -p$options{P}\" -i --delete $rsync_string $gtcfg_val_{treedir}/$options{h}/  $options{h}:/|") || die "\n\nCannot open $cli_Util{'rsync'}. Reason: $!\n";
+    write_log_("rsync.log","$cli_Util{'rsync'} $rsync_flags -e \"$cli_Util{'ssh'} -p$options{P}\" -i --delete $rsync_string $gtcfg_val_{treedir}/$options{h}/  $options{h}:/\n");
+    
+    my(%excluding,@deleting,@updated,@warnings);
+    while(<RSYNC>)
+    {
+        chomp $_;
+        if($options{d})
+        {
+            print "PRIMARY RSYNC ($options{h}): $_\n";
+            open(FILE, ">>/tmp/gt-debug.log");
+            print FILE "PRIMARY RSYNC ($options{h}): $_\n";
+            close(FILE);
+        }
+        #Remove some text
+        $_ =~ s/\[sender\] |\[receiver\] //g;
+        #Filter out some junk
+        if(/^$|^sending incremental file list|^building file list ...|^expand file_list\s\w+|^rsync: expand\s\w+|^opening connection\s\w+|^total|^wrote|^sent|^done|^excluding|^hiding|^delta( |-)transmission enabled|^deleting in \./)
+        {
+            next;
+        }
+        elsif(/^(\[generator\]) (excluding|protecting) (directory|file) .* because of pattern .*$/)
+        {
+            $_ =~ s/(\[generator\]) (excluding|protecting) (directory|file) //g;
+            my(@excl_str) = split(/ because of pattern /, $_, 2);
+            $excluding{$excl_str[0]} = $excl_str[1];
+        }
+        elsif(/WARNING: .* failed verification -- update discarded \(will try again\)\.|IO error encountered -- skipping file deletion|file has vanished: .*|rsync (error|warning): .*|cannot delete non-empty directory: .*/)
+        {
+            push(@warnings,$_);
+        }
+        else
+        {
+            my($attrs,$file) = split(/\s+/, $_, 2);
+            if($attrs =~ /($gtcfg_val_{report_ignore})/ && $gtcfg_val_{report_ignore} ne "no")
+	          {
+                next;
+            }
+            my(@itemized_attrs) = rsync_itemize($attrs);
+            if($itemized_attrs[0] eq "IDENTICAL")
+	          {
+                next;
+            }
+            elsif($itemized_attrs[0] eq "CHANGED")
+	          {
+                pop(@itemized_attrs);
+                push(@updated,"$file $attrs");
+                $fileschanged = 1;
+            }
+            elsif($itemized_attrs[0] eq "DELETED")
+	          {
+                push(@deleting,$file);
+                $fileschanged = 1;
+            }
+            else
+	          {
+                next;
+            }
+            
+        }
+    }
+    close(RSYNC);
+    
+    print("- complete.\n");
+    
+    # Create exclude.txt and run the backup rsync
+    my(@backedup,@b_uptodate,@b_deleting);
+    if($options{b})
+    {
+        my(@excl_new);
+        my @sorted_exclude_list = sort(keys(%excluding));
+        foreach my $item (@sorted_exclude_list)
+        {
+            push(@excl_new,"/$item");
+        }
+        open(EXCL, ">$gtcfg_val_{dbdir}/$options{h}/exclude.txt") || die("Cannot open /$gtcfg_val_{dbdir}/$options{h}/exclude.txt. Reason: $!\n");
+        foreach my $item (@excl_new)
+        {
+            print EXCL ("$item\n");
+        }
+        close(EXCL);
+        
+        print("Starting Rsync (2/2) on host ");
+        
+        # Generate a packages_backup.conf
+        create_packages_backupconf();
+        
+        if(! -e "$avail_hosts_{$options{h}}/backup.conf")
+        {
+            create_backupconf();
+        }
+        
+        # Array positions in @backup_info: 0 = days old to keep, 1 = all backup dirs, 2 = current time stamp
+        my @backup_info = get_backup_info();
+        
+        my @all_backup_dirs = de_ref_($backup_info[1],"array");
+        my $bdir1 = pop(@all_backup_dirs);
+        my $bdir2 = pop(@all_backup_dirs);
+        (($bdir1 == "") && ($bdir1 = 0));
+        (($bdir2 == "") && ($bdir2 = 0));
+        my $latest_backup_dir = get_latest_date($bdir1,$bdir2);
+        my $current_timestamp = $backup_info[2];
+        
+        my $backup_flags;
+        if($options{n})
+        {
+            $backup_flags = "-avvrn --sparse";
+        }
+        else
+        {
+            $backup_flags = "-avvr --sparse";
+        }
+        if($options{B})
+        {
+            $backup_flags .= " --bwlimit=$options{B} ";
+        }
+        if($options{z})
+        {
+            $backup_flags .= " -z ";
+        }
+        
+        #print("\n\nDEBUG: $cli_Util{'rsync'} $backup_flags --numeric-ids --delete --files-from=$gtcfg_val_{dbdir}/$options{h}/exclude.txt --exclude-from=$avail_hosts_{$options{h}}/backup.conf --link-dest=$gtcfg_val_{backupdir}/$options{h}/$latest_backup_dir $options{h}:/ $gtcfg_val_{backupdir}/$options{h}/$current_timestamp\n\n");
+        
+        open(RSYNC, "$cli_Util{'rsync'} -e \"$cli_Util{'ssh'} -p$options{P}\" $backup_flags --numeric-ids --delete --files-from=$gtcfg_val_{dbdir}/$options{h}/exclude.txt --exclude-from=$avail_hosts_{$options{h}}/backup.conf --exclude-from=$gtcfg_val_{dbdir}/$options{h}/packages_backup.conf --link-dest=$gtcfg_val_{backupdir}/$options{h}/$latest_backup_dir $options{h}:/ $gtcfg_val_{backupdir}/$options{h}/$current_timestamp 2>&1|") || die "\n\nCannot open $cli_Util{'rsync'} Reason: $!\n";
+        while(<RSYNC>)
+        {
+            chomp $_;
+            if($options{d})
+	          {
+                print "SECONDARY RSYNC ($options{h}): $_\n";
+                open(FILE, ">>/tmp/gt-debug.log");
+                print FILE "SECONDARY RSYNC ($options{h}): $_\n";
+                close(FILE);
+	          }
+            #Remove some text
+            $_ =~ s/\[sender\] |\[receiver\] //g;
+            #Filter out some junk
+            if(/^$|^\[generator\] |^\.\/$|^receiving file list \.\.\.|^sending incremental file list|^receiving incremental file list|^removing duplicate name|^building file list \.\.\.|^expand file_list\s\w+|^rsync: expand\s\w+|^opening connection\s\w+|^total|^wrote|^sent|^done|^excluding|^hiding|^created directory|^delta( |-)transmission enabled|^deleting in\s.*/)
+	          {
+                next;
+	          }
+            elsif(/WARNING: .* failed verification -- update discarded \(will try again\)\.|IO error encountered -- skipping file deletion|file has vanished: .*|rsync (error|warning): .*|rsync: link_stat .* failed: No such file or directory .*|rsync error: some files could not be transferred .*/) 
+            {
+                push(@warnings,$_);
+            }
+            elsif(/^deleting\s.*/)
+	          {
+                $_ =~ s/deleting directory/deleting/g;
+                my(@del_str) = split(/\s/, $_, 2);
+                push(@b_deleting,$del_str[1]);
+	          }
+            elsif(/is uptodate$/)
+	          {
+                my($file,undef) = split(/ is uptodate/, $_, 2);
+                push(@b_uptodate, $file);
+            }
+            else
+	          {
+                push(@backedup, $_);
+            }
+        }
+        close(RSYNC);
+        print("- complete.\n");
+        
+        print("Examining backup directory - ");
+        examine_backup_dir(@backup_info);
+        print("done.\n");
+    }
+    
+    print("Generating report ");
+    
+    open(GTREPORT, ">>/$gtcfg_val_{dbdir}/$options{h}/rsyncreport.txt") || die "\n\nCannot open /$gtcfg_val_{dbdir}/$options{h}/rsyncreport.txt Reason: $!\n";
+    
+    if(!$options{b})
+    {
+        print GTREPORT ("\nUpdated files and directories on $options{h}\n\n");
+        foreach my $item (sort(@updated))
+        {
+            # Take out space before and after the ->
+            $item =~ s/\s->\s/->/;
+            my($file,$attrs) = split(/\s/, $item, 2);
+            # Put spaces back in before and after the ->
+            $file =~ s/->/ -> /;
+            if($options{p})
+	          {
+                print GTREPORT ("/$file\n");
+	          }
+            else
+	          {
+                print GTREPORT ("updated\($attrs\): /$file\n");
+            }
+        }
+        my $files_updated = scalar(@updated);
+        if($files_updated == "0")
+        {
+            print GTREPORT ("nothing updated\n");
+        }
+        
+        print GTREPORT ("\nDeleted files and directories on $options{h}\n\n");
+        foreach my $file (sort(@deleting))
+        {
+            if($options{p})
+	          {
+                print GTREPORT ("/$file\n");
+	          }
+            else
+	          {
+                print GTREPORT ("deleted: /$file\n");
+            }
+        }
+        my $files_deleted = scalar(@deleting);
+        if($files_deleted == "0")
+        {
+            print GTREPORT ("nothing deleted\n");
+        }
+        
+        if(@warnings)
+        {
+            print GTREPORT ("\n\n**** Warnings ****\n\n");
+            foreach my $warn (@warnings)
+            {
+                print GTREPORT ("Rsync Warning: $warn\n");
+            }
+            print GTREPORT ("\n\n**** Warnings ****\n\n");
+        }
+        
+        print GTREPORT ("\nTotal files/directories updated: $files_updated\n");
+        print GTREPORT ("Total files/directories deleted: $files_deleted\n");
+    }
+    else
+    {
+        print GTREPORT ("\nBacked-up files and directories for $options{h}\n\n");
+        foreach my $file (sort(@backedup))
+        {
+            print GTREPORT ("backed up /$file\n");
+        }
+        my $files_backedup = scalar(@backedup);
+        if($files_backedup == "0")
+        {
+            print GTREPORT ("nothing backed up\n");
+        }
+        
+        print GTREPORT ("\nDeleted backed up files and directories for $options{h}\n\n");
+        foreach my $file (sort(@b_deleting))
+        {
+            print GTREPORT ("deleted /$file\n");
+        }
+        my $files_b_deleting = scalar(@b_deleting);
+        if($files_b_deleting == "0")
+        {
+            print GTREPORT ("nothing deleted in backup directory\n");
+        }
+        
+        print GTREPORT ("\nCurrent uptodate files and directories for $options{h}\n\n");
+        foreach my $file (sort(@b_uptodate))
+        {
+            print GTREPORT ("uptodate /$file\n");
+        }
+        my $files_b_uptodate = scalar(@b_uptodate);
+        if($files_b_uptodate == "0")
+        {
+            print GTREPORT ("none\n");
+        }
+        if(@warnings)
+        {
+            print GTREPORT ("\n\n**** Warnings ****\n\n");
+            foreach my $warn (@warnings)
+            {
+                print GTREPORT ("Rsync Warning: $warn\n");
+            }
+            print GTREPORT ("\n\n**** Warnings ****\n\n");
+        }
+        print GTREPORT ("\nTotal files/directories backed up: $files_backedup\n");
+        print GTREPORT ("Total files/directories deleted: $files_b_deleting\n");
+        print GTREPORT ("Total files/directories uptodate: $files_b_uptodate\n");
+    }
+    
+    close(GTREPORT);
+    
+    print("- done.\n");
+    
+    return($fileschanged);
+}
+
+sub examine_backup_dir
+{
+    my(@backup_info) = @_;
+    my $backup_days = $backup_info[0];
+    my @backup_dirs = de_ref_($backup_info[1],"array");
+    my $cur_tstamp = $backup_info[2];
+    
+    if($backup_dirs[-1] == $cur_tstamp)
+    {
+        die("This shouldn't be happening, it means 2 backups were done during the same second.\n");
+    }
+    
+    # Clean-up of old backup directories
+    foreach my $dir (@backup_dirs)
+    {
+        my $delta = DateCalc($dir,$cur_tstamp);
+        my $delta_days = Delta_Format($delta,0,"%dt");
+        if($delta_days > $backup_days && !$options{n})
+        {
+            system("$cli_Util{'rm'} -rf $gtcfg_val_{backupdir}/$options{h}/$dir");
+            write_log_("gt.log","Graviton deleted backup directory $gtcfg_val_{backupdir}/$options{h}/$dir, because it's older than $backup_days days.\n");
+        }
+        elsif($delta_days > $backup_days)
+        {
+            write_log_("gt.log","Graviton would have deleted backup directory $gtcfg_val_{backupdir}/$options{h}/$dir, because it's older than $backup_days days.\n");
+        }
+        
+    }
+}
+
+sub create_backupconf
+{
+    open(BKUP, ">$avail_hosts_{$options{h}}/backup.conf") || die("Cannot open $avail_hosts_{$options{h}}/backup.conf. Reason $!\n");
+    print BKUP ("# This file was created for you.\n");
+    print BKUP ("# List items you do not want backed up here.\n");
+    print BKUP ("# Use rsync exclude syntax.\n");
+    print BKUP ("/proc/*\n");
+    print BKUP ("/dev/*\n");
+    print BKUP ("/sys/*\n");
+    print BKUP ("/tmp/*\n");
+    print BKUP ("*.pid\n");
+    close(BKUP);
+}
+
+sub create_packages_backupconf
+{
+    open(BKUP, ">$gtcfg_val_{dbdir}/$options{h}/packages_backup.conf") || die("Cannot open $gtcfg_val_{dbdir}/$options{h}/packages_backup.conf. Reason $!\n");
+    print BKUP ("# This file was automatically created for you.\n");
+    print BKUP ("# Don't manually change anything in here.\n");
+    my %seen;
+    foreach my $item (@backupexcludes_List)
+    {
+        if($seen{$item})
+        {
+            next;
+        }
+        else
+        {
+            print BKUP ("$item\n");
+            $seen{$item}++;
+        }
+    }
+    close(BKUP);
+}
+
+sub rsync_doflags
+{
+    my($flag_dryrun,$flag_checksum,$flag_bandwidth,$flag_port,$flag_compress,$flag_rsyncpath,$flags);
+    if($options{n})
+    {
+        $flag_dryrun = "-n";
+    }
+    if($options{c})
+    {
+        $flag_checksum = "-c";
+    }
+    if($options{B})
+    {
+        $flag_bandwidth = "--bwlimit=$options{B}";
+    }
+    if($options{b})
+    {
+        $flag_dryrun = "-n"; 
+    }
+    if($options{z})
+    {
+        $flag_compress = "-z"; 
+    }
+    if($options{Y})
+    {
+        $flag_rsyncpath = "--rsync-path=$options{Y}";
+    }
+    
+    $flags = "-avv --numeric-ids $flag_compress $flag_rsyncpath $flag_dryrun $flag_checksum $flag_bandwidth -e \"ssh -i $ssh_Params{private_key}\"";
+    
+    return $flags;
+}
+
+
+sub begin_process
+{
+    if(! -e "$gtcfg_val_{dbdir}/$options{h}")
+    {
+        system("$cli_Util{'mkdir'} -p $gtcfg_val_{dbdir}/$options{h}");
+    }
+    if($options{b} && ! -e "$gtcfg_val_{backupdir}/$options{h}")
+    {
+        system("$cli_Util{'mkdir'} -p $gtcfg_val_{backupdir}/$options{h}");
+    }
+    system("$cli_Util{'echo'} Last run by: USER=\$USER SUDO_USER=\$SUDO_USER > $gtcfg_val_{dbdir}/$options{h}/gt_lock");
+    system("$cli_Util{'date'} >> $gtcfg_val_{dbdir}/$options{h}/gt_lock");
+}
+
+sub create_report
+{
+    my $date = `$cli_Util{'date'}`;
+    system("$cli_Util{'touch'} $gtcfg_val_{dbdir}/$options{h}/dbreport.txt");
+    system("$cli_Util{'cp'} $gtcfg_val_{dbdir}/$options{h}/dbreport.txt $gtcfg_val_{dbdir}/$options{h}/refreport.txt");
+    if(!$options{l}) 
+    {
+        system("$cli_Util{'cat'} $gtcfg_val_{dbdir}/$options{h}/rsyncreport.txt >> $gtcfg_val_{dbdir}/$options{h}/refreport.txt");
+    }
+    if(!$options{b} && !$options{l})
+    {
+        system("$cli_Util{'cat'} $gtcfg_val_{dbdir}/$options{h}/excludereport.txt >> $gtcfg_val_{dbdir}/$options{h}/refreport.txt");
+    }
+    open(GTREPORT, ">>/$gtcfg_val_{dbdir}/$options{h}/refreport.txt") or die "\n\nCannot open /$gtcfg_val_{dbdir}/$options{h}/refreport.txt Reason: $!";
+    print GTREPORT "\n\n\n\nGT Flags and Values\n***********************\n";
+    print GTREPORT "Non-Boolean Options\n\n-h: $options{h}\n-C: $options{C}\n-B: $options{B}\n\nBoolean Options (value 1 if used)\n\n-n: $options{n}\n-c: $options{c}\n-L: $options{L}\n-R: $options{R}\n-v: $options{v}\n-b: $options{b}\n";
+    print GTREPORT "***********************\n";
+    close(GTREPORT);
+    unlink("$gtcfg_val_{dbdir}/$options{h}/dbreport.txt");
+    unlink("$gtcfg_val_{dbdir}/$options{h}/rsyncreport.txt");
+    unlink("$gtcfg_val_{dbdir}/$options{h}/excludereport.txt");
+}
+
+sub send_email_report
+{
+    chomp $options{m};
+    my $date = `$cli_Util{'date'}`;
+    
+    if($options{m} || $gtcfg_val_{email_alwayson} eq "yes")
+    {
+        if($options{m} eq "")
+        {
+            $options{m} = $gtcfg_val_{email}; 
+        }
+        print("\nSending Email Report to $options{m}.\n\n");
+        system("$cli_Util{'cat'} $gtcfg_val_{dbdir}/$options{h}/refreport.txt|$cli_Util{'mail'} -s \"GT Report for $options{h} at $date\" $options{m}");
+    }
+}
+
+sub finish_up
+{
+    if($options{n} || $options{b} && -e "$gtcfg_val_{dbdir}/$options{h}/packageold.db")
+    {
+        rename("$gtcfg_val_{dbdir}/$options{h}/packageold.db","$gtcfg_val_{dbdir}/$options{h}/package.db");
+    }
+    unlink("$gtcfg_val_{dbdir}/$options{h}/gt_lock");
+}
+
+sub host_alive
+{
+    # If they want Linktree only, don't see if the host is alive, chances are it's a phantom host 
+    # for the purposes of generating a linktree
+    if(!$options{P})
+    {
+        $options{P} = 22;
+    }
+    if(!$options{l})
+    {
+        my($tcp_conn);
+        if($tcp_conn = IO::Socket::INET->new( Proto => "tcp", PeerAddr => "$options{h}", PeerPort => "$options{P}" ))
+        {
+            print $tcp_conn "GT Host Alive Check\n";
+            close($tcp_conn);
+        }
+        else
+        {
+            print("\n\nCannot connect to port $options{P} (ssh) on host $options{h}. Reason: $!\n");
+            next;
+        }
+    }
+}
+
+sub get_deps
+{
+    #Read in 1st list of packages from host.conf
+    my($initial_list_ref,$block_list_ref,$exclude_list_ref,$execute_list_ref,$pass_num) = @_;
+    my @inc_list = de_ref_($initial_list_ref,"array");
+    my @blk_list = de_ref_($block_list_ref,"array");
+    my %excl_list = de_ref_($exclude_list_ref,"hash");
+    my @exec_list = de_ref_($execute_list_ref,"array");
+    my @bkupexcl_list;
+    my %reptigno_list;
+    
+    
+    #######################################################################
+    # $item below is in the following format
+    # ($package,$version,$parent)
+    # Example($package):  "admin/hotplug" or "non-free/libs/jre_1.4"
+    # Example($version):  "0.0.20040329-17"
+    # Example($parent):   "admin/udev" or "non-free/devel/java"
+    # As far as 'blocked' packages go, the value after the last / is the
+    # package name.  It's also the value we care about for possible package
+    # 'collisions'.
+    #######################################################################
+    
+    my($uniq_ref,$seen_ref,$coll_ref,$warn_ref) = get_uniq(\@inc_list,\@blk_list,undef,undef,undef,$pass_num);
+    
+    my @hostcnf_master = de_ref_($uniq_ref,"array");
+    my %seen = de_ref_($seen_ref,"hash");
+    my %coll = de_ref_($coll_ref,"hash");
+    my %warn = de_ref_($warn_ref,"hash");
+    
+    # Now, lets take our unique list and get all all the rest of the
+    # dependencies
+    
+    # Take the 1st item off the @hostcnf_master list to seed @uniq_master
+    my @uniq_master;
+    foreach my $item (@hostcnf_master)
+    {
+        #print("ITEM: $item\n") unless $pass_num == 1;
+        push(@uniq_master,$item);
+        foreach my $item (@uniq_master)
+        {
+            #print("ITEM2: $item\n") unless $pass_num == 1;
+            my($parver);
+            my(@new_pkgs,@new_block,%new_exclude,@new_execute,@new_backupexcludes,%new_reportignore);
+            #Read the new list of names from the package.conf
+            my($pkg,$ver,$par) = split(/,/, $item, 3);
+            if(! -e "$gtcfg_val_{packdir}/$packBase/$pkg/$ver/package.conf")
+	          {
+                while(my($key,$val) = each(%seen))
+                {
+                    if($key =~ /^$par.*/)
+                    {
+                        (undef,$parver,undef) = split(/,/, $key, 3);
+                    }
+                }
+                suggest_fix($pkg,$packBase,$ver,$par,$parver);
+	          }
+            else
+	          {
+                my($new_pkgs_ref,$new_block_ref,$new_exclude_ref,$new_execute_ref,$new_backupexcludes_ref,$new_reportignore_ref) = parse_packageconf($packBase,$pkg,$ver,$par,%seen);
+                @new_pkgs = de_ref_($new_pkgs_ref,"array");
+                @new_block = de_ref_($new_block_ref,"array");
+                %new_exclude = de_ref_($new_exclude_ref,"hash");
+                @new_execute = de_ref_($new_execute_ref,"array");
+                @new_backupexcludes = de_ref_($new_backupexcludes_ref,"array");
+                %new_reportignore = de_ref_($new_reportignore_ref,"hash");
+                push(@blk_list,@new_block);
+                if($pass_num == 2)
+                {
+                    %excl_list = (%excl_list,%new_exclude);
+                    push(@bkupexcl_list,@new_backupexcludes);
+                }
+                push(@exec_list,@new_execute);
+                %reptigno_list = (%reptigno_list,%new_reportignore);
+                
+                ($uniq_ref,$seen_ref,$coll_ref,$warn_ref) = get_uniq(\@new_pkgs,\@blk_list,\%seen,\%coll,\%warn,$pass_num);
+                %seen = de_ref_($seen_ref,"hash");
+                %coll = de_ref_($coll_ref,"hash");
+                %warn = de_ref_($warn_ref,"hash");
+                my @uniq = de_ref_($uniq_ref,"array");
+                push(@uniq_master,@uniq);
+	          }
+        }
+    }
+    
+    #print("DEBUG: $debug\n");
+    
+    return(\@uniq_master,\@blk_list,\%excl_list,\@exec_list,\@bkupexcl_list,\%reptigno_list,\%warn);
+}
+
+sub get_uniq
+{
+    my($list_ref,$blocked_ref,$seen_ref,$coll_ref,$warn_ref,$pass_num) = @_;
+    
+    my @list = de_ref_($list_ref,"array");
+    my @blocked = de_ref_($blocked_ref,"array");
+    my %seen = de_ref_($seen_ref,"hash");
+    my %coll = de_ref_($coll_ref,"hash");
+    my %warn = de_ref_($warn_ref,"hash");
+    
+    #If this is the first pass from get_deps, don't block anything!
+    my %block_pkgs;
+    if($pass_num == 2)
+    {
+        #Turn blocked array ref into %block_pkgs
+        foreach my $item (@blocked)
+        {
+            my(@pkgblk_full) = split(/<DELIM>/, $item);
+            pop(@pkgblk_full);
+            my($pkg_full) = join(",",@pkgblk_full);
+            my($pkg,$ver,$par) = split(/,/, $pkg_full, 3);
+            my @package = split(/\//, $pkg);
+            $block_pkgs{$package[-1]}++;
+        }
+    }
+    else
+    {
+        %block_pkgs = ();
+    }
+    
+    #Make sure all duplicates are taken out
+    my @uniq = ();
+    foreach my $item (@list)
+    {
+        # Tear the $item apart
+        my($pkg,$ver,$par) = split(/,/, $item, 3);
+        my @package = split(/\//, $pkg);
+        
+        #Package must not have been seen before and must also not be
+        #in the blocked list.
+        if(!$seen{"$pkg,$ver"} && !$block_pkgs{$package[-1]})
+        {
+            #print("DEBUG: Adding $item to uniq pkg list.\n");
+            
+            #Push pkg,ver,par to @uniq, but below, we have to use
+            #pkg,ver for uniq-ness in %seen.  Otherwise, you could have
+            #the same package called from 2 different parents,
+            #the pkg,ver,par would be different and consequently
+            #would make matching in the $seen hash impossible.
+            push(@uniq, "$pkg,$ver,$par");
+            $seen{"$pkg,$ver"}++;
+            #print("NEW: $pkg,$ver\n") unless $pass_num == 1;
+            
+            #Do a collision check
+            my @pkg_check = split(/\//, $pkg);
+            my $pkg_basic = $pkg_check[-1];
+            if($coll{"$pkg_basic"})
+	          {
+                $warn{"($options{h}): Possible package conflict \"$coll{$pkg_basic}\" and \"$pkg/$ver\")"} = "WARN";
+            }
+            else
+	          {
+                $coll{"$pkg_basic"} = "$pkg/$ver";
+            }
+        }
+        else
+        {
+            #print("SEEN ALREADY: $pkg,$ver\n") unless $pass_num == 1;
+            next;
+            
+            #If we get here, it means the package has been seen before
+            #and would be a great place to track package collisions.
+            #
+            #AMENDMENT: I placed the collision check up above in the 
+            #           previous block.
+            #
+            #  $pkg can look like this: base/libc6
+            #  $pkg can also look like this: non-free/lib/jre_1.4
+            #
+            #  As far as we're concerned (and debian), the last part
+            #  is the package name.  So for the 1st line, libc6 is the
+            #  package name and jre_1.4 is the package name for the 
+            #  second line.
+            #
+            #When the debian maintainers package things, they choose
+            #a 'section' that the package belongs in.  For libc6, it's 
+            #always been in section 'base'.  This hasn't been true for
+            #some packages such as python, which used to be in section
+            #'interpreters', but later was moved to section 'python'.
+            #
+            #This can cause problems when deb2pkg goes to auto-build
+            #package.conf's.  When gtdbgen runs, it records all the
+            #packages it can see under your $packDir and if it finds
+            #more than one python (whether it be in interpreters/python
+            #or python/python), it will put those in $infoDir/packages.db.
+            #
+            #When deb2pkg runs and it see's that a package depends on
+            #'python', it'll not only see the one in interpreters, but
+            #also the one in python and add both to the package.conf.
+            #
+            #This may be desired in some cases, but would be a
+            #problem if the host is using packages primarily downloaded
+            #from a debian apt source.
+            #
+            #Package collision detection will examine the last part of
+            #$pkg and alert the user that 2 versions of the same package
+            #name are being used and tell the user which package.conf(s)
+            #contain the conflicting entries.
+        }
+    }
+    
+    return(\@uniq,\%seen,\%coll,\%warn);
+}
+
+
+sub build_deb_status
+{
+    my @list = @_;
+    my $pkg;
+    
+    system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/status.tmp");
+    
+    open(TMPSTAT, ">>$gtcfg_val_{dbdir}/$options{h}/status.tmp") or die("\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/status.tmp Reason: $!\n");
+    foreach $pkg (@list)
+    {
+        my($package,$ver,$parent) = split(/,/, $pkg, 3);
+        if(-e "$gtcfg_val_{packdir}/$packBase/$package/$ver/debian/control")
+        {
+            open(CTRL, "$gtcfg_val_{packdir}/$packBase/$package/$ver/debian/control") or die("\n\nCannot open $gtcfg_val_{packdir}/$packBase/$package/$ver/debian/control Reason: $!\n");
+            while(<CTRL>)
+	          {
+                if(/^Package:/)
+                {
+                    print TMPSTAT "$_";
+                    print TMPSTAT "Status: install ok installed\n";
+                }
+                else
+                {
+                    print TMPSTAT "$_";
+                }
+            }
+            print TMPSTAT "\n";
+            close(CTRL);
+        }
+    }
+    close(TMPSTAT);
+    
+}
+
+sub build_rpm_status
+{
+    print("Generating RedHat status file");
+    my @list = @_;
+    
+    system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/status.tmp");
+    
+    open(TMPSTAT, ">>$gtcfg_val_{dbdir}/$options{h}/status.tmp") or die("\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/status.tmp. Reason: $!\n");
+    foreach my $pkg (@list)
+    {
+        my($package,$ver,$parent) = split(/,/, $pkg, 3);
+        if(-e "$gtcfg_val_{packdir}/$packBase/$package/$ver/redhat/filename")
+        {
+            open(CTRL, "$gtcfg_val_{packdir}/$packBase/$package/$ver/redhat/filename") or die("\n\nCannot open $gtcfg_val_{packdir}/$packBase/$package/$ver/redhat/filename. Reason: $!\n");
+            while(<CTRL>)
+	          {
+                print TMPSTAT "$_";
+            }
+            close(CTRL);
+        }
+    }
+    close(TMPSTAT);
+    
+    print(" - done.");
+    
+    build_rpm_db();
+}
+
+sub build_rpm_db
+{
+    
+    if(-d "$gtcfg_val_{dbdir}/$options{h}/rpms")
+    {
+        system("$cli_Util{'rm'} -rf $gtcfg_val_{dbdir}/$options{h}/rpms");
+        system("$cli_Util{'mkdir'} $gtcfg_val_{dbdir}/$options{h}/rpms");
+    }
+    else
+    {
+        system("$cli_Util{'mkdir'} $gtcfg_val_{dbdir}/$options{h}/rpms");
+    }
+    if(-d "$gtcfg_val_{dbdir}/$options{h}/rpmdb")
+    {
+        system("$cli_Util{'rm'} -rf $gtcfg_val_{dbdir}/$options{h}/rpmdb");
+        system("$cli_Util{'mkdir'} $gtcfg_val_{dbdir}/$options{h}/rpmdb");
+    }  
+    else
+    {
+        system("$cli_Util{'mkdir'} $gtcfg_val_{dbdir}/$options{h}/rpmdb");
+    }
+    
+    my @findray;
+    open(STATUS, "$gtcfg_val_{dbdir}/$options{h}/status.tmp") or die("\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/status.tmp. Reason: $!\n");
+    while(<STATUS>)
+    {
+        chomp;
+        push(@findray,$_); 
+    }
+    close(STATUS);
+    
+    # Make hardlink tree of all rpms this system is currently using
+    print(" / Creating linktree of rpms ");
+    my $findstr = join(" -o -name ", @findray);
+    $findstr = "-name $findstr";
+    open(FIND, "$cli_Util{'find'} $gtcfg_val_{packdir}/$packBase -path '*/files/*' -prune -name '' -o $findstr|") || die "Cannot run $cli_Util{'find'} $gtcfg_val_{packdir}/$packBase -path '*/files/*' -prune -name '' -o $findstr";
+    while(<FIND>)
+    {
+        chomp;
+        my @pkg = split(/\//, $_);
+        if($options{d})
+        {
+            print ("Linking $_ to $gtcfg_val_{dbdir}/$options{h}/rpms\n");
+        }
+        system("$cli_Util{'ln'} $_ $gtcfg_val_{dbdir}/$options{h}/rpms");
+    }
+    close(FIND);
+    print("- done.");
+    
+    print(" / Rebuilding rpm database ");
+    system("$cli_Util{'rpm'} --quiet --dbpath $gtcfg_val_{dbdir}/$options{h}/rpmdb --justdb --nodeps --force -i $gtcfg_val_{dbdir}/$options{h}/rpms/*.rpm 2> /dev/null");   
+    
+    system("$cli_Util{'mkdir'} -p $avail_hosts_{$options{h}}/files/var/lib/rpm");
+    system("$cli_Util{'cp'} -a $gtcfg_val_{dbdir}/$options{h}/rpmdb/* $avail_hosts_{$options{h}}/files/var/lib/rpm");
+    print("- done.\n");
+}
+
+sub cp_debian_status
+{
+    my($pkgschanged) = @_;
+    if($pkgschanged != "0" || ! -e "$avail_hosts_{$options{h}}/files/var/lib/dpkg/status")
+    { 
+        #if($options{v})
+        #   {
+        #      print("Creating new status file.\n");
+        #   }
+        system("$cli_Util{'mkdir'} -p $avail_hosts_{$options{h}}/files/var/lib/dpkg");
+        system("$cli_Util{'cp'} $gtcfg_val_{dbdir}/$options{h}/status.tmp $avail_hosts_{$options{h}}/files/var/lib/dpkg/status");
+        system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/status.tmp");
+    }
+}
+
+sub cp_redhat_status
+{
+    my($pkgschanged) = @_;
+    if($pkgschanged != "0")
+    { 
+        system("$cli_Util{'mkdir'} -p $avail_hosts_{$options{h}}/files/var/lib/rpm");
+        system("$cli_Util{'cp'} $gtcfg_val_{dbdir}/$options{h}/status.tmp $avail_hosts_{$options{h}}/files/var/lib/rpm/status");
+        system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/status.tmp");
+    }
+}
+
+sub write_pkgdep
+{
+    my(@final_list) = @_;
+    my($x) = 1;
+    
+    open(TXT, ">$gtcfg_val_{dbdir}/$options{h}/package.dep") || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/package.dep Reason: $!\n";
+    foreach(@final_list)
+    {
+        print TXT "$x - $_\n";
+        $x++;
+    }
+    close(TXT);
+}
+
+sub write_pkgdb
+{
+    my(@final_list) = @_;
+    my($x) = 1;
+    my(%pkgdb);
+    
+    if(-e "$gtcfg_val_{dbdir}/$options{h}/package.db")
+    {
+        rename("$gtcfg_val_{dbdir}/$options{h}/package.db","$gtcfg_val_{dbdir}/$options{h}/packageold.db") || die "\n\nCannot rename $gtcfg_val_{dbdir}/$options{h}/package.db to $gtcfg_val_{dbdir}/$options{h}/packageold.db Reason: $!\n";
+    }
+    
+    dbmopen(%pkgdb, "$gtcfg_val_{dbdir}/$options{h}/package.db",0644) || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/package.db Reason: $!\n";
+    
+    foreach(@final_list)
+    {
+        $pkgdb{$x} = $_;
+        $x++;
+    }
+    
+    dbmclose(%pkgdb);
+    
+    ## NEW SQL BASED PACKAGE DATABASE (Thanks to Dan Gast dan@gasts.com)
+    my $dbh = DBI->connect("dbi:SQLite:$gtcfg_val_{dbdir}/$options{h}/package.sq3") || die "Cannot connect: $DBI::errstr";
+    
+    # Create the session table to track our GT runs
+    $dbh->do("CREATE TABLE IF NOT EXISTS sessions (sess_id INTEGER PRIMARY KEY AUTOINCREMENT,tstamp)");
+    $dbh->do("INSERT INTO sessions (tstamp) values (strftime('%Y%d%m%H%M%S','now'))");
+    
+    # Create the package and package_old tables in an order which will handle both brand new host databases and
+    # to accomdate existing host databases.
+    $dbh->do("DROP TABLE IF EXISTS packages_old");
+    $dbh->do("CREATE TABLE IF NOT EXISTS packages (seqnum INTEGER PRIMARY KEY AUTOINCREMENT,pkg_name,pkg_ver,pkg_parent)");
+    $dbh->do("ALTER TABLE packages RENAME TO packages_old");
+    $dbh->do("CREATE TABLE IF NOT EXISTS packages (seqnum INTEGER PRIMARY KEY AUTOINCREMENT,pkg_name,pkg_ver,pkg_parent)");
+    
+    foreach my $pkg (@final_list)
+    {
+        my($name,$version,$parent) = split(/,/, $pkg);
+        $dbh->do("INSERT INTO packages (pkg_name,pkg_ver,pkg_parent) VALUES ('$name','$version','$parent')");
+    }
+}  
+
+sub write_blkdb
+{
+    my(@blocked_list) = @_;
+    my(%blkdb);
+    
+    dbmopen(%blkdb, "$gtcfg_val_{dbdir}/$options{h}/blocked.db",0644) || die "\n\nCannot open $gtcfg_val_{dbdir}/$options{h}/blocked.db Reason: $!\n";
+    
+    %blkdb = ();
+    
+    $blkdb{dbtype} = "blocked";
+    
+    foreach my $item (@blocked_list)
+    {
+        my($pkg,$par) = split(/<DELIM>/, $item, 2);
+        $blkdb{$pkg} = $par;
+    }
+    
+    dbmclose(%blkdb);
+}  

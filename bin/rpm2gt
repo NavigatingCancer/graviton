@@ -1,0 +1,461 @@
+#!/usr/bin/perl
+################################################################################
+#rpm2gt is a utility to unpackage .rpm packages written by Joshua McClintock
+#and is part of a larger suite called Graviton.
+#Copyright (C) 2012 Gravity Edge Systems, LLP
+#
+#This program is free software; you can redistribute it and/or
+#modify it under the terms of the GNU General Public License
+#as published by the Free Software Foundation; either version 2
+#of the License, or (at your option) any later version.
+#
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+#
+#You should have received a copy of the GNU General Public License
+#along with this program; if not, write to the Free Software
+#Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#You may contact the author Joshua McClintock <joshua at gravityedge dot com>
+################################################################################
+
+################################################################################
+# Program: rpm2gt
+# Purpose: Tear apart rpm packages and place them into the GT tree
+#     Use: rpm2gt -p <package.rpm>
+#   Flags: UPDATE THIS
+################################################################################
+
+BEGIN
+   {
+      push(@INC,"/gt/lib/gt","/gt/lib/deb2gt","/gt/lib/rpm2gt");
+   }
+
+
+use strict;
+use Getopt::Std;
+use gt;
+use rpm2gt;
+
+#Global vars
+my $_VERSION_ = "1.31";
+
+#Global Utilities
+my(%cli_Util) = set_util_loc_();
+
+#Global Configuration
+my %gtcfg_val = r_gt_cfg_();
+
+my (%options);
+
+getopts("b:p:t:APHcdV", \%options);
+
+if($options{V})
+   {
+      die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2012.\n");
+   }
+
+if($options{H})
+   {
+      do_help();
+   }
+
+if(! defined($options{A}) && ! defined($options{p}))
+   {
+      die("You must use either -p or -A, use -H for help.\n");
+   }
+
+# Set $options{b} to the default value if no value given on the command line
+$options{b} = "$gtcfg_val{rpm2gt_defbase}" unless defined $options{b};
+
+if($options{A})
+   {
+      my @packages = get_packages();
+      foreach(@packages)
+         {
+	    chomp;
+	    $options{p} = $_;
+	    do_main();
+	 }
+   }
+else
+   {
+      do_main()
+   }
+
+
+############## Begin Subs #####################
+
+
+sub do_help
+{
+   if($options{H})
+      {
+         die("\n\t  Use:\trpm2gt -p <package.rpm>\n\n\tFlags:\t-A Process all rpm packages (*.rpm) in current directory\n\t\t-p <package.rpm>\n\t\t-P Pre-Process package\n\t\t-t <linkname>\n\t\t-c Only useful with -t, will add tag version information to the package.conf for each package processed with the value of -t\n\t\t-d Debug/Script Mode - if enabled, rpm2gt will print out the fact that a package it processed required user interaction, but will choose number 1.\n\t\t-b <default base> - The default value for this option is specified in gt.conf by rpm2gt_defbase.  Use this option to override the default.\n\t\t-V output version information and quit\n\n");
+      }
+}
+
+
+
+sub do_main
+{
+   if(! -e "$options{p}")
+      {
+         die("No package called $options{p} exists in current directory\n");
+      }
+   my @full_pkg_name = split(/\//, $options{p});
+   my @pkg_parts = split(/\./, $full_pkg_name[-1]);
+   print("\n  *** Name: $full_pkg_name[-1] Arch: $pkg_parts[-2] ***   \n\n");
+   print("Getting version and package info");
+   my(%control);
+   # Set arch in %control since it's not found within the package contents, had to grab it from the filename.arch.rpm
+   $control{Arch} = $pkg_parts[-2];
+   %control = rpm_get_info_($options{p},undef,"rpmpkg",\%control);
+   %control = rpm_get_deps_($options{p},undef,"rpmpkg",\%control);
+   %control = rpm_get_prov_($options{p},undef,"rpmpkg",\%control);
+   %control = rpm_get_filelist_($options{p},undef,"rpmpkg",\%control);
+
+   my($name,$version,$release,$group,$depends_ref,$provides_ref,$filelist_ref) = rpm_extract_info_(%control);
+   my(@depends) = de_ref_($depends_ref,"array");
+   my(@provides) = de_ref_($provides_ref,"array");
+   my(@filelist) = de_ref_($filelist_ref,"array");
+
+   my($status,$finalDest);
+   print(" - done.\n");
+   if($options{P})
+      {
+         ($status,$finalDest) = preprocess_package($options{p},$options{b},\%control);
+      }
+   else
+      {
+         ($status,$finalDest) = create_package($options{p},$options{b},\%control);
+      }
+   if($status == "0")
+      {
+         print(" - done.\n");
+         print("\nPackage \"$group/$name.$control{Arch}/$version-$release\" created in $gtcfg_val{packdir}/$finalDest, you may need to symlink the version you want to use with \"current\".\n\n");
+         write_log_("rpm2gt.log","\"$group/$name.$control{Arch}/$version-$release\" created in $gtcfg_val{packdir}/$finalDest, you may need to symlink the version you want to use with \"current\".\n\n");
+      }
+   elsif($status == "1")
+      {
+         print(" - done.\n");
+	 print("\nPackage \"$group/$name.$control{Arch}/$version-$release\" Pre-processed.\n\n");
+      }
+   else
+      {
+         print("\n\nPackage \"$group/$name.$control{Arch}/$version-$release\" already exists.\n\n");
+      }
+}
+
+sub create_package
+{
+   print("Beginning package creation process");
+   my $exists = 0;
+   my $altlink = 0;
+   if($options{t} && $options{t} ne "")
+      {
+         $altlink = 1;
+      }
+
+   my(@final_depends,%packagesdb,$origbase);
+   my($package,$base,$control_ref) = @_;
+   my(%control) = de_ref_($control_ref,"hash");
+   my(@depends) = split(/,/, $control{Depends});
+   my(@provides) = split(/,/, $control{Provides});
+   my(@filelist) = split(/,/, $control{FileList});
+
+   $origbase = $base;
+   if($control{"Group"} ne "")
+      {
+         $base = $base . "/$control{Group}";
+      }
+   if(-d "$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}")
+      {
+         if(-d "$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}")
+	    {
+	       $exists = 1;
+	    }
+	 else
+	    {
+	       system("$cli_Util{mkdir} -p $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}");
+	    }
+      }
+   else
+      {
+         system("$cli_Util{mkdir} -p $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}");
+      }
+   if($exists != "1")
+      {
+         @final_depends = figure_dependencies("$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}",@depends);
+	 mkdir("$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat");
+         mkdir("$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/files");
+         system("$cli_Util{cp} $package $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/files");
+	 my @full_pkg_name = split(/\//, $package);
+	 system("cd $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/files ; $cli_Util{rpm2cpio} $full_pkg_name[-1] | $cli_Util{cpio} -idm 2> /dev/null");
+	 system("$cli_Util{mv} $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/files/$full_pkg_name[-1] $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat");
+	 open(FILELIST, ">$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/list") || die("Cannot open $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/list. Reason: $!\n");
+	 foreach my $item (@filelist)
+	    {
+	       print FILELIST "$item\n";
+	    }
+	 close(FILELIST);
+	 
+	 my @provides_list = split(/,/, $control{Provides});
+	 open(PROVIDES, ">$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/provides") || die("Cannot open $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/provides. Reason: $!\n");
+	 foreach my $item (@provides_list)
+	    {
+	       print PROVIDES ("$item\n");
+	    }
+	 close(PROVIDES);
+	 
+	 my @requires_list = split(/,/, $control{Depends});
+	 open(REQUIRES, ">$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/requires") || die("Cannot open $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/requires. Reason: $!\n");
+	 foreach my $item (@requires_list)
+	    {
+	       print REQUIRES ("$item\n");
+	    }
+	 close(REQUIRES);
+
+	 system("$cli_Util{rpm} -qpi $package > $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/info");
+
+	 rpm_get_scripts_($package,"$control{Name}.$control{Arch}","$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}");
+
+         my @pkg_full_name = split(/\//, $options{p});
+	 system("$cli_Util{echo} $pkg_full_name[-1] > $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/$control{Version}-$control{Release}/redhat/filename");
+
+         # Add package to packages.db so that it shows up as an available package when figure_dependencies is run
+         updt_pkgs_db_($origbase,$control{Group},"$control{Name}.$control{Arch}","$control{Version}-$control{Release}");
+         rpm_updt_provides_db_("$control{Name}.$control{Arch}",$origbase,@provides);
+	 if(! $options{t} eq "")
+	    {
+	       system("cd $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch} ; $cli_Util{ln} -nsf $control{Version}-$control{Release} $options{t}");
+	    }
+	 if(! -l "$gtcfg_val{packdir}/$base/$control{Name}.$control{Arch}/current")
+	    {
+	       system("cd $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch} ; $cli_Util{ln} -s $control{Version}-$control{Release} current");
+	    }
+      }
+   else
+      {
+         if($altlink == "1")
+	    {
+	       system("cd $gtcfg_val{packdir}/$base/$control{Name}.$control{Arch} ; $cli_Util{ln} -nsf $control{Version}-$control{Release} $options{t}");
+	    }
+	 return(2,$base);
+      }
+
+return(0,$base);
+}
+
+sub preprocess_package
+{
+   print("Pre-processing package");
+   my($package,$base,$control_ref) = @_;
+   my(%control) = de_ref_($control_ref,"hash");
+   my $origbase = $base;
+   if($control{"Group"} ne "")
+      {
+         $base = $base . "/$control{Group}";
+      }
+   
+   my(@provides) = split(/,/, $control{Provides});
+
+   updt_pkgs_db_($origbase,$control{Group},"$control{Name}.$control{Arch}","$control{Version}-$control{Release}");
+   rpm_updt_provides_db_("$control{Name}.$control{Arch}",$origbase,@provides);
+
+   return(1,$base);
+}
+
+sub figure_dependencies
+{
+   my($fqpack,@final_depends) = @_;
+   my($depend,$version,%pkgconf_add,%chose,$choice,$prov_choice);
+   open(PKGCONF, ">$gtcfg_val{packdir}/$fqpack/package.conf") or die("NOT HERE: $gtcfg_val{packdir}/$fqpack/package.conf\n");
+   my %pkgs_db = r_gt_db_("$gtcfg_val{infodir}/packages.db");
+   delete($pkgs_db{"dbtype"});
+   #Load up $options{b}_provides.db in case we need it
+   my %provides_db = r_gt_db_("$gtcfg_val{infodir}/$options{b}" . "_provides.db");
+   my %seen_prov_depend;
+   #Uncomment line below for debug
+   #print("\n\nDEPEND: $depends\n\n");
+   foreach(@final_depends)
+      {
+         #print("DEPEND: $_\n");
+         s/^\s//;
+	 if(/\|/)
+	    {
+	       my $x = 1;
+	       my @choices = split(/\|/, $_);
+	       print("\nThis package depends on one of the following.\n");
+	       foreach(@choices)
+	          {
+		     s/^\s//;
+		     print("$x: $_\n");
+		     $x++;
+		  }
+	       if(! $options{d})
+	          {
+	             print("Please choose: ");
+	             $choice = <STDIN>;
+		  }
+	       else
+	          {
+		     write_log_("rpm2gt.log","$fqpack had multiple choice dependancies, chose #1 because -d was given.\n");
+		     print STDERR "[WARN] Package $fqpack had multiple choice dependancies, chose #1 because -d was given.\n";
+		     $choice = 1;
+		  }
+	       chomp($choice);
+	       $choice--;
+	       if($choices[$choice] =~ /\s\(.*\)/)
+	          {
+	             ($depend,$version) = split(/\s/, $choices[$choice], 2);
+	          }
+	       else
+	          {
+		     $depend = $choices[$choice];
+		     $version = "N/A";
+		  }
+	    }
+	 else
+	    {
+	       if(/\s\(.*\)/)
+	          {
+	             ($depend,$version) = split(/\s/, $_, 2);
+		  }
+	       else
+	          {
+		     $depend = $_;
+		     $version = "N/A";
+		  }
+	    }
+
+         $depend =~ s/\s//;
+	 
+	 if(my %found = search_pkgs_db($options{b},$depend,%pkgs_db))
+	    {
+	       my($sec,$ver) = split(/,/, $found{$depend}, 2);
+	       $pkgconf_add{"$sec/$depend"} = $ver;
+	    }
+	 elsif($provides_db{$depend} && !$seen_prov_depend{$depend} && !search_pkgs_db($options{b},$depend,%pkgs_db))
+	    {
+	       $seen_prov_depend{$depend}++;
+	       my @prov_by = split(/,/, $provides_db{$depend});
+               # Try to make x86_64 first if it's there vs i686
+               @prov_by = sort(@prov_by);
+               @prov_by = reverse(@prov_by);
+
+               my $x = 1;
+	      
+	       # Do a pre-check to see if any of the items in @prov_by have been chosen before.
+	       my $already_chosen = 0;
+	       foreach my $item (@prov_by)
+	          {
+		     if($chose{$item})
+		        {
+			   $already_chosen = 1;
+			}
+	             else
+		        {
+			   next;
+			}
+		  }
+	       if($already_chosen == 0)
+	          {
+	             print("\nThis package depends on $depend which doesn't exist.\n");
+	             print("The package(s) below can provide it.\n");
+	             foreach my $item (@prov_by)
+	                {
+	                   print("$x: $item\n");
+                           $x++;
+		        }
+	             if(! $options{d})
+	                {
+	                   print("Please choose: ");
+	                   $choice = <STDIN>;
+	                }
+	             else
+	                {
+		           write_log_("rpm2gt.log","$fqpack had multiple providers, chose #1 because -d was given.\n");
+		           print STDERR "[WARN] Package $fqpack had multiple providers, chose #1 because -d was given.\n";
+		           $choice = 1;
+		        }
+                     chomp($choice);
+	             $choice--;
+	             $chose{$prov_by[$choice]}++;
+	             if(my %found = search_pkgs_db($options{b},$prov_by[$choice],%pkgs_db))
+	                {
+	                   my($sec,$ver) = split(/,/, $found{$prov_by[$choice]}, 2);
+	                   $pkgconf_add{"$sec/$prov_by[$choice]"} = $ver;
+	                }
+                  }
+            }
+      }
+   if($options{t} && $options{c})
+      {
+         while(my($key,$value) = each(%pkgconf_add))
+            {
+	       print PKGCONF ("include $key $options{t}\n");
+            }
+      }
+   else
+      {
+         while(my($key,$value) = each(%pkgconf_add))
+            {
+	       print PKGCONF ("include $key\n");
+            }
+      }
+
+   close(PKGCONF);
+}
+
+sub search_pkgs_db
+{
+   my($pkg_base,$package,%pkgs_db) = @_;
+   my(%found,$ver_sav);
+   
+   while(my($key,$value) = each(%pkgs_db))
+      {
+	 my($base,$pkg_full) = split(/:::/, $key, 2);
+	 $base =~ /\[(.*)\]/;
+	 $base = $1;
+	 # Don't allow use of packages outside the defined base ($options{b})
+	 # This prevents packages from being reccommended to fill a dependency
+	 # that are not part of the defined base.
+	 # i.e. Don't let a Debian package fill a RedHat dependency
+	 if($pkg_base eq $base)
+	    {
+	       my @pkg_ray = split(/\//, $pkg_full);
+	       my $ver = pop(@pkg_ray);
+	       my $pkg = pop(@pkg_ray);
+	       my $sec = join("/", @pkg_ray);
+	       #print("SECTION: $sec PACKAGE: $pkg VERSION: $ver\n");
+	       if($package eq $pkg)
+	          {
+	             if(rpm_cmp_version_($ver,$ver_sav) > 0)
+	                {
+		           #print("THIS IS GREATER: $ver THAN THIS: $ver_sav\n");
+		           $ver_sav = $ver;
+	                   $found{"$pkg"} = "$sec,$ver";
+		        }
+	          }
+            }
+	 else
+	    {
+	       next;
+	    }
+      }
+
+   return(%found);
+}
+
+sub get_packages
+{
+   my(@packages);
+   opendir(DIR, ".");
+   @packages = grep { /\.rpm$/ } readdir(DIR);
+   closedir(DIR);
+
+   return @packages;
+}

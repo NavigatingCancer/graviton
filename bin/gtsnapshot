@@ -1,0 +1,126 @@
+#!/usr/bin/perl
+################################################################################
+#gtsnapshot is a utility for managing package trees written by Joshua McClintock
+#and is part of a larger suite called Graviton.
+#Copyright (C) 2008 Gravity Edge Systems, LLP
+#
+#This program is free software; you can redistribute it and/or
+#modify it under the terms of the GNU General Public License
+#as published by the Free Software Foundation; either version 2
+#of the License, or (at your option) any later version.
+#
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+#
+#You should have received a copy of the GNU General Public License
+#along with this program; if not, write to the Free Software
+#Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#You may contact the author Joshua McClintock <joshua at gravityedge dot com>
+################################################################################
+################################################################################
+# Program: gtsnapshot
+# Purpose: gtsnapshot is a perl script which will create new links in all 
+#          packages
+#          which point to the version specified, effectively snapshotting a tree
+#          so that you can subscribe to the new tree with the linktag option in
+#          the host.conf.
+#     Use: gtsnapshot -b <tree base> -c <existing symlink> -n <new symlink>
+################################################################################
+
+BEGIN
+   {
+      push(@INC,"/gt/lib/gt","/gt/lib/deb2gt","/gt/lib/rpm2gt");
+   }
+
+use strict;
+use Cwd;
+use Getopt::Std;
+use File::Find;
+use gt qw(:DEFAULT %avail_hosts_ %host_groups_);
+
+my $_VERSION_ = "1.02";
+
+#Global Utilities
+my(%cli_Util) = set_util_loc_();
+#Global Config Options
+my(%gtcfg_Val) = r_gt_cfg_();
+#Global Variables
+my(%bases,%packages,%options);
+
+#Load up %avail_hosts_ %host_groups_
+find_all_hosts_();
+
+getopts("b:c:n:HV", \%options);
+
+if($options{V})
+   {
+      die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2012.\n");
+   }
+
+if($options{H})
+   {
+      do_help();
+   }
+
+if(! $options{c})
+   {
+      die("Must provide an arguement to -c.  This is the value for the 'current' symbolic link you wish to snapshot.\n");
+   }
+if(! $options{n})
+   {
+      die("Must provide an arguement to -n.  This is the value for the 'new' symbolic link you wish to create.\n");
+   }
+if(! $options{b})
+   {
+      die("Must provide an arguement to -b.  This is the value for the package base you wish to run snapshot against.\n");
+   }
+
+find(\&process_file, "$gtcfg_Val{packdir}/$options{b}");
+
+
+############### Begin Subs ##################
+
+sub do_help
+{
+   if($options{H})
+      {
+         die("\n\t  Use:\tgtdbgen\n\n\t\t-b Package base to perform snapshot on.\n\t\t-c Symbolic link you'd like to snapshot.\n\t\t-n New symbolic link name you'd like created during the snapshot process.\n\n");
+      }
+}
+
+sub process_file
+{
+   my($cur_symlink,$new_symlink) = ($options{c},$options{n});
+   my($ver);
+   
+   if(/^files$/ and $File::Find::prune = 1 and -e "$File::Find::dir/package.conf")
+      {
+         # Valid package found if we get here.
+	 if(! readlink("$File::Find::dir/../$cur_symlink"))
+	    {
+	       print STDERR ("Symbolic link $cur_symlink does not exist for $File::Find::dir!\n");
+	    }
+	 else
+	    {
+	       $ver = readlink("$File::Find::dir/../$cur_symlink");
+	       if(! -e "$File::Find::dir/../$new_symlink")
+	          {
+		     my @dir = split(/\//, $File::Find::dir);
+		     print("Symlinking $dir[-3]\/$dir[-2]\/$ver to $new_symlink in tree $options{b}\n");
+		     my $cwd = getcwd();
+		     chdir("$File::Find::dir/..");
+		     symlink("$ver","$new_symlink") || die("Cannot symlink $File::Find::dir/../$ver to $File::Find::dir/../$new_symlink. Reason: $!\n");
+		     chdir($cwd);
+		  }
+	       else
+	          {
+		     next;
+		  }
+	    }
+
+	 #print("For package: $File::Find::dir\n$cur_symlink -> $ver\n$new_symlink -> $ver\n\n\n");
+      }
+}

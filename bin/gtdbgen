@@ -1,0 +1,145 @@
+#!/usr/bin/perl
+################################################################################
+#gtdbgen is a database utility written by Joshua McClintock 
+#and is part of a larger suite called Graviton.
+#Copyright (C) 2008 Gravity Edge Systems, LLP
+#
+#This program is free software; you can redistribute it and/or
+#modify it under the terms of the GNU General Public License
+#as published by the Free Software Foundation; either version 2
+#of the License, or (at your option) any later version.
+#
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+#
+#You should have received a copy of the GNU General Public License
+#along with this program; if not, write to the Free Software
+#Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#You may contact the author Joshua McClintock <joshua at gravityedge dot com>
+################################################################################
+
+################################################################################
+# Program: gtdbgen
+# Purpose: GTdbgen is a perl script that builds a database of all available
+# 	   packages within the system.  The database is called packages.db and
+# 	   should live in the info directory defined in gt.conf.
+#     Use: gtdbgen
+################################################################################
+
+BEGIN
+   {
+      push(@INC,"/gt/lib/gt","/gt/lib/deb2gt","/gt/lib/rpm2gt");
+   }
+
+use strict;
+use Getopt::Std;
+use DB_File;
+use File::Find;
+use gt qw(:DEFAULT %avail_hosts_ %host_groups_);
+use deb2gt;
+use rpm2gt;
+
+my $_VERSION_ = "1.15";
+
+#Global Utilities
+my(%cli_Util) = set_util_loc_();
+#Global Config Options
+my(%gtcfg_Val) = r_gt_cfg_();
+#Global Variables
+my(%bases,%packages,%options);
+
+#Load up %avail_hosts_ %host_groups_
+find_all_hosts_();
+
+getopts(":b:hHV", \%options);
+
+if($options{V})
+   {
+      die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2008.\n");
+   }
+
+if($options{H})
+   {
+      do_help();
+   }
+
+begin_process();
+open_dbs();
+find(\&process_file, $gtcfg_Val{packdir});
+tag_dbs();
+close_dbs();
+
+
+############### Begin Subs ##################
+
+sub begin_process
+{
+   if(! -d "$gtcfg_Val{infodir}")
+      {
+         system("$cli_Util{'mkdir'} -p $gtcfg_Val{infodir}");
+      }
+}
+
+sub do_help
+{
+   if($options{H})
+      {
+         die("\n\t  Use:\tgtdbgen\n\n\t\t-H Prints this help page.\n\t\t-b Rebuild db's for <base> instead of all bases (NOT IMPLIMENTED).\n\t\t-h Rebuild db's for host specific data and skip the package base databases (NOT IMPLIMENTED).\n\n");
+      }
+}
+			
+
+sub open_dbs
+{
+   system("$cli_Util{'rm'} $gtcfg_Val{infodir}/*.db");
+   dbmopen(%bases, "$gtcfg_Val{infodir}/bases.db",0644);
+   dbmopen(%packages, "$gtcfg_Val{infodir}/packages.db",0644);
+}
+
+sub tag_dbs
+{
+   $bases{dbtype} = "gtdbgen";
+   $packages{dbtype} = "gtdbgen";
+}
+
+sub close_dbs
+{
+   dbmclose(%bases);
+   dbmclose(%packages);
+}
+
+sub process_file
+{
+   my($fqpackage,$base,$group,$stuff,$package);
+   
+   if(/^files$/ and $File::Find::prune = 1 and -e "$File::Find::dir/package.conf")
+      {
+         (undef,$fqpackage) = split(/$gtcfg_Val{packdir}/, $File::Find::name, 2);
+	 (undef,$base,$stuff) = split(/\//, $fqpackage, 3);
+	 ($package,undef) = split(/\/files$/, $stuff, 2);
+	 $bases{$base} = 1;
+	 $packages{"\[$base\]:::". $package} = 1;
+	 my @pkg_ray = split(/\//, $package);
+	 pop(@pkg_ray);
+	 my $pkg = pop(@pkg_ray);
+	 #If this is a Debian package, lets update the $base_provides.db
+	 if(-d "$File::Find::dir/debian")
+	    {
+	       #print("Got here: $File::Find::dir/debian/control  Package: $pkg\n");
+	       my(%control) = deb_get_packinfo_(undef,"$File::Find::dir/debian/control","debcontrol");
+	       my(@provides) = split(/,/, $control{"Provides"});
+	       deb_updt_provides_db_($pkg,$base,@provides);
+	    }
+	 #If this is a RedHat package, lets update the $base_provides.db
+	 elsif(-d "$File::Find::dir/redhat")
+	    {
+	       my(%control) = rpm_get_prov_(undef,"$File::Find::dir/redhat/provides","rpmcontrol",undef);
+	       my(@provides) = split(/,/, $control{"Provides"});
+	       rpm_updt_provides_db_($pkg,$base,@provides);
+	    }
+	       
+      }
+}

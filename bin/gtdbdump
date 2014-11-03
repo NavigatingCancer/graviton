@@ -1,0 +1,167 @@
+#!/usr/bin/perl
+################################################################################
+#gtdbdump is a database utility written by Joshua McClintock 
+#and is part of a larger suite called Graviton.
+#Copyright (C) 2008 Gravity Edge Systems, LLP
+#
+#This program is free software; you can redistribute it and/or
+#modify it under the terms of the GNU General Public License
+#as published by the Free Software Foundation; either version 2
+#of the License, or (at your option) any later version.
+#
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+#
+#You should have received a copy of the GNU General Public License
+#along with this program; if not, write to the Free Software
+#Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#You may contact the author Joshua McClintock <joshua@gravityedge.com>
+################################################################################
+
+BEGIN
+   {
+      push(@INC,"/gt/lib/gt","/gt/lib/deb2gt","/gt/lib/rpm2gt");
+   }
+
+use strict;
+use DB_File;
+use Getopt::Std;
+use gt;
+
+my $_VERSION_ = "1.91";
+
+my %options;
+
+getopts("d:HV", \%options);
+
+if($options{V})
+   {
+      die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2008.\n");
+   }
+
+if($options{H})
+   {
+      do_help();
+   }
+
+if(! $options{d})
+   {
+      die("Must give -d <database.db>\n");
+   }
+
+do_main();
+
+############### Begin Subs #####################
+
+
+sub do_help
+{
+   if($options{H})
+      {
+         die("\n\t  Use:\tgtdbdump -d <database.db>\n\n\t\t-H Prints this help page.\n\n");
+      }
+}
+
+sub do_main
+{
+   my(%pkgdb,$version,$package,$parpack);
+
+   if(! -e $options{d})
+      {
+         die("Cannot open $options{d}.\n");
+      }
+
+   tie(%pkgdb, "DB_File", "$options{d}") || die "Cannot open $options{d}, no such file.\n";
+
+   if($pkgdb{dbtype} eq "gtdbgen")
+      {
+         while(my($key, $value) = each(%pkgdb))
+            {
+	       if($key eq "dbtype")
+	          {
+		     next;
+		  }
+               my($junk,$stuff) = split(/:::/, $key);
+               my(@values) = split(/\//, $stuff);
+	       pop(@values);
+	       print("Package: $key\n");
+            }
+      }
+   elsif($pkgdb{dbtype} eq "blocked")
+      {
+         while(my($key, $value) = each(%pkgdb))
+            {
+	       if($key eq "dbtype")
+	          {
+		     next;
+		  }
+	       print("\"$key\" blocked by \"$value\"\n");
+            }
+      }
+   elsif($pkgdb{dbtype} eq "exclude")
+      {
+         while(my($pattern,$parent) = each(%pkgdb))
+	    {
+	       if($pattern eq "dbtype")
+	          {
+		     next;
+		  }
+	       print("Pattern: $pattern Excluded by: $parent\n");
+	    }
+      }
+   elsif($pkgdb{dbtype} eq "provides")
+      {
+         while(my($key, $value) = each(%pkgdb))
+	    {
+	       if($key eq "dbtype")
+	          {
+		     next;
+		  }
+	       print("Package: $key Provided by: $value\n");
+	    }
+      }
+   elsif($pkgdb{dbtype} eq "execute")
+      {
+         while(my($key,$val) = each(%pkgdb))
+	    {
+	       if($key eq "dbtype")
+	          {
+		     next;
+		  }
+	       my @commands = split(/<DELIM>/, $val);
+	       foreach my $cmd (@commands)
+	          {
+		     my($type,$command) = split(/<UNIT>/, $cmd, 2);
+	             print("Parent: $key Type: $type Command: $command\n");
+		  }
+	    }
+      }
+   elsif($pkgdb{dbtype} eq "host_executes")
+      {
+         while(my($key,$val) = each(%pkgdb))
+	    {
+	       if($key eq "dbtype")
+	          {
+		     next;
+		  }
+	       my($pkg,$ver) = split(/<DELIM>/, $key, 2);
+	       print("Package: $pkg Version: $ver Disposition: $val\n");
+	    }
+      }
+   else
+      {
+         while(my($key, $value) = each(%pkgdb))
+            {
+	       if($key eq "dbtype")
+	          {
+		     next;
+		  }
+               ($package,$version,$parpack) = split(/,/, $value, 3); 
+               print("Key: $key Package: $package Version: $version Parent Package: $parpack\n");
+            }
+      }
+   untie(%pkgdb);
+}

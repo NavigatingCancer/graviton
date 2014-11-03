@@ -1,0 +1,429 @@
+#!/usr/bin/perl
+################################################################################
+#deb2gt is a utility to unpackage .deb packages written by Joshua McClintock
+#and is part of a larger suite called Graviton.
+#Copyright (C) 2008 Gravity Edge Systems, LLP
+#
+#This program is free software; you can redistribute it and/or
+#modify it under the terms of the GNU General Public License
+#as published by the Free Software Foundation; either version 2
+#of the License, or (at your option) any later version.
+#
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#GNU General Public License for more details.
+#
+#You should have received a copy of the GNU General Public License
+#along with this program; if not, write to the Free Software
+#Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#You may contact the author Joshua McClintock <joshua at gravityedge dot com>
+################################################################################
+
+################################################################################
+# Program: deb2gt
+# Purpose: Tear apart debian packages and place them into the GT tree
+#     Use: deb2gt -p <package.deb>
+#   Flags: UPDATE THIS
+#  Thanks: Sam Vanderhyden (sam dot vanderhyden at gmail dot com)
+################################################################################
+
+BEGIN
+   {
+      push(@INC,"/gt/lib/gt","/gt/lib/deb2gt","/gt/lib/rpm2gt");
+   }
+
+use strict;
+use Getopt::Std;
+use gt;
+use deb2gt;
+
+#Global vars
+my $_VERSION_ = "1.22";
+
+#Global Utilities
+my(%cli_Util) = set_util_loc_();
+
+#Global Configuration
+my %gtcfg_val = r_gt_cfg_();
+
+
+my $deb_arch_dir = deb_get_arch_dir_();
+my (%options);
+
+getopts("b:p:t:APHcdV", \%options);
+
+if($options{V})
+   {
+      die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2008.\n");
+   }
+
+if($options{H})
+   {
+      do_help();
+   }
+
+if(! defined($options{A}) && ! defined($options{p}))
+   {
+      die("You must use either -p or -A, use -H for help.\n");
+   }
+
+# Set $options{b} to the default value if no value given on the command line
+$options{b} = "$gtcfg_val{deb2gt_defbase}" unless defined $options{b};
+
+if($options{A})
+   {
+      my @packages = get_packages();
+      foreach(@packages)
+         {
+	    chomp;
+	    $options{p} = $_;
+	    do_main();
+	 }
+   }
+else
+   {
+      do_main()
+   }
+
+
+############## Begin Subs #####################
+
+
+sub do_help
+{
+   if($options{H})
+      {
+         die("\n\t  Use:\tdeb2gt -p <package.deb>\n\n\tFlags:\t-A Process all debian packages (*.deb) in /var/cache/apt/archives\n\t\t-p <package.deb>\n\t\t-P Pre-Process package\n\t\t-t <linkname>\n\t\t-c Only useful with -t, will add tag version information to the package.conf for each package processed with the value of -t\n\t\t-d Debug/Script Mode - if enabled, deb2gt will print out the fact that a package it processed required user interaction, but will choose number 1.\n\t\t-b <default base> - The default value for this option is specified in gt.conf by deb2gt_defbase.  Use this option to override the default.\n\t\t-V output version information and quit\n\n");
+      }
+}
+
+
+
+sub do_main
+{
+   if(! -e "$deb_arch_dir/$options{p}")
+      {
+         die("No package called $options{p} exists in $deb_arch_dir\n");
+      }
+   print("\n  *** $options{p} ***   \n\n");
+   print("Getting version and package info");
+   my(%control) = deb_get_packinfo_($options{p},undef,"debpkg");
+   my($ver,$pak,$sec,@dep) = deb_extract_info_(%control);
+   my($status,$finalDest);
+   #select(undef,undef,undef,1);
+   print(" - done.\n");
+   if($options{P})
+      {
+         ($status,$finalDest) = preprocess_package($options{p},$options{b},$ver,$pak,$sec,\@dep,\%control);
+      }
+   else
+      {
+         ($status,$finalDest) = create_package($options{p},$options{b},$ver,$pak,$sec,\@dep,\%control);
+      }
+   if($status == "0")
+      {
+         #select(undef,undef,undef,1);
+         print(" - done.\n");
+         print("\nPackage \"$sec/$pak/$ver\" created in $gtcfg_val{packdir}/$finalDest, you may need to symlink the version you want to use with \"current\".\n\n");
+         write_log_("deb2gt.log","\"$sec/$pak/$ver\" created in $gtcfg_val{packdir}/$finalDest, you may need to symlink the version you want to use with \"current\".\n\n");
+      }
+   elsif($status == "1")
+      {
+         print(" - done.\n");
+	 print("\nPackage \"$sec/$pak/$ver\" Pre-processed.\n\n");
+      }
+   else
+      {
+         print("\n\nPackage \"$sec/$pak/$ver\" already exists.\n\n");
+      }
+}
+
+sub create_package
+{
+   print("Beginning package creation process");
+   my $exists = 0;
+   my $altlink = 0;
+   if($options{t} && $options{t} ne "")
+      {
+         $altlink = 1;
+      }
+   my(@final_depends,%packagesdb,$origbase);
+   my($package,$base,$version,$packname,$section,$depends_ref,$control_ref) = @_;
+   my(@depends) = de_ref_($depends_ref,"array");
+   my(%control) = de_ref_($control_ref,"hash");
+   my(@provides) = split(/,/, $control{"Provides"});
+   $origbase = $base;
+   if($section ne "")
+      {
+         $base = $base . "/$section";
+      }
+   if(-d "$gtcfg_val{packdir}/$base/$packname")
+      {
+         if(-d "$gtcfg_val{packdir}/$base/$packname/$version")
+	    {
+	       $exists = 1;
+	    }
+	 else
+	    {
+	       system("$cli_Util{'mkdir'} -p $gtcfg_val{packdir}/$base/$packname/$version");
+	    }
+      }
+   else
+      {
+         system("$cli_Util{'mkdir'} -p $gtcfg_val{packdir}/$base/$packname/$version");
+      }
+   if($exists != "1")
+      {
+         @final_depends = figure_dependencies("$base/$packname/$version",@depends);
+	 mkdir("$gtcfg_val{packdir}/$base/$packname/$version/debian");
+         mkdir("$gtcfg_val{packdir}/$base/$packname/$version/files");
+         system("$cli_Util{'cp'} $deb_arch_dir/$package $gtcfg_val{packdir}/$base/$packname/$version/files");
+        
+	 open(FILELIST, ">$gtcfg_val{packdir}/$base/$packname/$version/debian/list") || die("Cannot open $gtcfg_val{packdir}/$base/$packname/$version/debian/list. Reason: $!\n");
+	 open(DPKG, "$cli_Util{'dpkg'} -X $gtcfg_val{packdir}/$base/$packname/$version/files/$package $gtcfg_val{packdir}/$base/$packname/$version/files|") || die("Cannot open $cli_Util{'dpkg'}. Reason: $!\n");
+	 while(<DPKG>)
+	    {
+	       print FILELIST "$_";
+	    }
+	 close(DPKG);
+	 close(FILELIST);
+
+	 system("$cli_Util{'dpkg-deb'} -e $gtcfg_val{packdir}/$base/$packname/$version/files/$package $gtcfg_val{packdir}/$base/$packname/$version/debian");
+	 # Do this first before the package get's moved into the control dir by the next line.
+	 cp_control_into_package($package,$base,$version,$packname,$section);
+         system("$cli_Util{mv} $gtcfg_val{packdir}/$base/$packname/$version/files/$package $gtcfg_val{packdir}/$base/$packname/$version/debian");
+         # Add package to packages.db so that it shows up as an available package when figure_dependencies is run
+         updt_pkgs_db_($origbase,$section,$packname,$version);
+         deb_updt_provides_db_($packname,$origbase,@provides);
+	 if(! $options{t} eq "")
+	    {
+	       system("cd $gtcfg_val{packdir}/$base/$packname ; $cli_Util{'ln'} -nsf $version $options{t}");
+	    }
+	 if(! -l "$gtcfg_val{packdir}/$base/$packname/current")
+	    {
+	       system("cd $gtcfg_val{packdir}/$base/$packname ; $cli_Util{'ln'} -s $version current");
+	    }
+      }
+   else
+      {
+         if($altlink == "1")
+	    {
+	       system("cd $gtcfg_val{packdir}/$base/$packname ; $cli_Util{'ln'} -nsf $version $options{t}");
+	    }
+	 return(2,$base);
+      }
+
+return(0,$base);
+}
+
+sub preprocess_package
+{
+   print("Pre-processing package");
+   my($package,$base,$version,$packname,$section,$depends_ref,$control_ref) = @_;
+   my(@depends) = de_ref_($depends_ref,"array");
+   my(%control) = de_ref_($control_ref,"hash");
+   my $origbase = $base;
+   if($section ne "")
+      {
+         $base = $base . "/$section";
+      }
+   
+   my(@provides) = split(/,/, $control{"Provides"});
+
+   updt_pkgs_db_($origbase,$section,$packname,$version);
+   deb_updt_provides_db_($packname,$origbase,@provides);
+
+return(1,$base);
+}
+
+sub figure_dependencies
+{
+   my($fqpack,@final_depends) = @_;
+   my($depend,$version,%pkgconf_add,$choice,$prov_choice);
+   open(PKGCONF, ">$gtcfg_val{packdir}/$fqpack/package.conf") or die("NOT HERE: $gtcfg_val{packdir}/$fqpack/package.conf\n");
+   my %pkgs_db = r_gt_db_("$gtcfg_val{infodir}/packages.db");
+   delete($pkgs_db{"dbtype"});
+   #Load up $options{b}_provides.db in case we need it
+   my %provides_db = r_gt_db_("$gtcfg_val{infodir}/$options{b}" . "_provides.db");
+   my %seen_prov_depend;
+   #Uncomment line below for debug
+   #print("\n\nDEPEND: $depends\n\n");
+   foreach(@final_depends)
+      {
+         #print("DEPEND: $_\n");
+         s/^\s//;
+	 if(/\|/)
+	    {
+	       my $x = 1;
+	       my @choices = split(/\|/, $_);
+	       print("\nThis package depends on one of the following.\n");
+	       foreach(@choices)
+	          {
+		     s/^\s//;
+		     print("$x: $_\n");
+		     $x++;
+		  }
+	       if(! $options{d})
+	          {
+	             print("Please choose: ");
+	             $choice = <STDIN>;
+		  }
+	       else
+	          {
+		     write_log_("deb2gt.log","$fqpack had multiple choice dependancies, chose #1 because -d was given.\n");
+		     print STDERR "[WARN] Package $fqpack had multiple choice dependancies, chose #1 because -d was given.\n";
+		     $choice = 1;
+		  }
+	       chomp($choice);
+	       $choice--;
+	       if($choices[$choice] =~ /\s\(.*\)/)
+	          {
+	             ($depend,$version) = split(/\s/, $choices[$choice], 2);
+	          }
+	       else
+	          {
+		     $depend = $choices[$choice];
+		     $version = "N/A";
+		  }
+	    }
+	 else
+	    {
+	       if(/\s\(.*\)/)
+	          {
+	             ($depend,$version) = split(/\s/, $_, 2);
+		  }
+	       else
+	          {
+		     $depend = $_;
+		     $version = "N/A";
+		  }
+	    }
+
+         $depend =~ s/\s//;
+	 
+	 if(my %found = search_pkgs_db($options{b},$depend,%pkgs_db))
+	    {
+	       my($sec,$ver) = split(/,/, $found{$depend}, 2);
+	       $pkgconf_add{"$sec/$depend"} = $ver;
+	    }
+	 elsif($provides_db{$depend} && !$seen_prov_depend{$depend} && !search_pkgs_db($options{b},$depend,%pkgs_db))
+	    {
+	       $seen_prov_depend{$depend}++;
+	       my @prov_by = split(/,/, $provides_db{$depend});
+               my $x = 1;
+	       print("\nThis package depends on $depend which doesn't exist.\n");
+	       print("The package(s) below can provide it.\n");
+	       foreach my $item (@prov_by)
+	          {
+	             print("$x: $item\n");
+                     $x++;
+		  }
+	       if(! $options{d})
+	          {
+	             print("Please choose: ");
+	             $choice = <STDIN>;
+	          }
+	       else
+	          {
+		     write_log_("deb2gt.log","$fqpack had multiple providers, chose #1 because -d was given.\n");
+		     print STDERR "[WARN] Package $fqpack had multiple providers, chose #1 because -d was given.\n";
+		     $choice = 1;
+		  }
+               chomp($choice);
+	       $choice--;
+	       if(my %found = search_pkgs_db($options{b},$prov_by[$choice],%pkgs_db))
+	          {
+	             my($sec,$ver) = split(/,/, $found{$prov_by[$choice]}, 2);
+	             $pkgconf_add{"$sec/$prov_by[$choice]"} = $ver;
+	          }
+            }
+      }
+   if($options{t} && $options{c})
+      {
+         while(my($key,$value) = each(%pkgconf_add))
+            {
+	       print PKGCONF ("include $key $options{t}\n");
+            }
+      }
+   else
+      {
+         while(my($key,$value) = each(%pkgconf_add))
+            {
+	       print PKGCONF ("include $key\n");
+            }
+      }
+
+   close(PKGCONF);
+}
+
+sub search_pkgs_db
+{
+   my($pkg_base,$package,%pkgs_db) = @_;
+   my(%found,$ver_sav);
+   
+   while(my($key,$value) = each(%pkgs_db))
+      {
+         my($base,$pkg_full) = split(/:::/, $key, 2);
+         $base =~ /\[(.*)\]/;
+         $base = $1;
+         # Don't allow use of packages outside the defined base ($options{b})
+         # This prevents packages from being reccommended to fill a dependency
+         # that are not part of the defined base.
+         # i.e. Don't let a Debian package fill a RedHat dependency
+         if($pkg_base eq $base)
+            {
+               my @pkg_ray = split(/\//, $pkg_full);
+               my $ver = pop(@pkg_ray);
+               my $pkg = pop(@pkg_ray);
+               my $sec = join("/", @pkg_ray);
+               #print("SECTION: $sec PACKAGE: $pkg VERSION: $ver\n");
+               if($package eq $pkg)
+                  {
+                     if(deb_cmp_version_($ver,$ver_sav) > 0)
+                        {
+                           #print("THIS IS GREATER: $ver THAN THIS: $ver_sav\n");
+                           $ver_sav = $ver;
+                           $found{"$pkg"} = "$sec,$ver";
+                        }
+                  }
+            }
+         else
+            {
+               next;
+            }
+      }
+
+   return(%found);
+}
+
+sub get_packages
+{
+   my(@packages);
+   opendir(DIR, $deb_arch_dir);
+   @packages = grep { /\.deb$/ } readdir(DIR);
+   closedir(DIR);
+
+return @packages;
+}
+
+
+sub cp_control_into_package
+{
+   my($name);
+   my($package,$base,$version,$packname,$section) = @_;
+
+   system("$cli_Util{'mkdir'} -p $gtcfg_val{packdir}/$base/$packname/$version/files/var/lib/dpkg/info");
+
+   opendir(DEBCONTDIR, "$gtcfg_val{packdir}/$base/$packname/$version/debian") || die "Cannot open $gtcfg_val{packdir}/$base/$packname/$version/debian\n";
+   while($name = readdir(DEBCONTDIR))
+     { 
+        if($name eq "." || $name eq "..")
+           {
+              next;
+           }
+	system("$cli_Util{'cp'} $gtcfg_val{packdir}/$base/$packname/$version/debian/$name $gtcfg_val{packdir}/$base/$packname/$version/files/var/lib/dpkg/info/$packname.$name");
+     }
+   closedir(DEBCONTDIR);
+}
