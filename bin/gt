@@ -1,36 +1,42 @@
 #!/usr/bin/perl
 ################################################################################
-# gt is a wrapper script for rsync and ssh written by Joshua McClintock
-# and is part of a larger suite called Graviton.
-# Copyright (C) 2012 Gravity Edge Systems, LLP
-#
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-#
-# You may contact the author Joshua McClintock <joshua at gravityedge dot com>
+# gt is a wrapper script for rsync and ssh written by Joshua McClintock        #
+# and is part of a larger suite called Graviton.                               #
+# Copyright (C) 2012 Gravity Edge Systems, LLP                                 #
+#                                                                              #
+# This program is free software; you can redistribute it and/or                #
+# modify it under the terms of the GNU General Public License                  #
+# as published by the Free Software Foundation; either version 2               #
+# of the License, or (at your option) any later version.                       #
+#                                                                              #
+# This program is distributed in the hope that it will be useful,              #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of               #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the                #
+# GNU General Public License for more details.                                 #
+#                                                                              #
+# You should have received a copy of the GNU General Public License            #
+# along with this program; if not, write to the                                #
+# Free Software Foundation, Inc.,                                              #
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.                 #
+#                                                                              #
+# You may contact the author Joshua McClintock <joshua at gravityedge dot com> #
+#                                                                              #
 ################################################################################
+
 
 ################################################################################
 # Program: gt
 # Purpose: GT is a wrapper script for rsync and ssh
 #     Use: gt -h host.domain.com
 #   Flags:
-#          -h (hostname) -n (boolean, use this flag for a dryrun) -m (email 
-#             address)
+#          -h (hostname)
 #          -n dry run
 #          -c turn on 128 bit MD5 checksumming (will go slower)
 #          -v extra verbosity
+#          -d show debugging info
+#
+#          -G ??????????????????????
+#
 #          -l build linktree only, do not run rsync
 #          -L don't rebuild linktree, this will speedup the app if your sure 
 #             nothing has changed in the packages on the server side
@@ -47,7 +53,6 @@
 #          -V output copyright and version number and quit
 #
 #          -s script mode, just answer no to hosts which have lock files detected
-#          -d debug
 #          -z add compression
 #     	   -I ssh identity [pubkey,privkey] (e.g. "/root/id_dsa.pub,/root/id_dsa")
 ################################################################################
@@ -114,6 +119,8 @@ if($options{V})
     die("Graviton v$_VERSION_, Copyright Gravity Edge Systems, LLP 2012.\n");
 }
 
+
+
 if($options{G})
 {
     my $hostcount = 0;
@@ -131,6 +138,7 @@ if($options{G})
     }
     die("Graviton Managed Hosts: $hostcount\n");
 }
+
 
 unless($options{h} || $options{g})
 {
@@ -250,7 +258,7 @@ sub do_host
         }
         system("$cli_Util{'rm'} -f $gtcfg_val_{dbdir}/$options{h}/*.db");
         begin_process();
-        print(" - done.\n");
+        print(" - \x1b[0;32mdone\x1b[39;49m.\n");
     }
     
     if(!$options{L} && !$options{b})
@@ -266,7 +274,7 @@ sub do_host
     my $passNum = 1;
     #(undef,$blockMaster_ref,undef,undef,undef,undef) = get_deps(\@include_List,\@block_List,undef,undef,$passNum);
     #@block_List = de_ref_($blockMaster_ref,"array");
-    #print(" - done.\n");
+    #print(" - \x1b[0;32mdone\x1b[39;49m.\n");
     
     #print("Gathering final dependancies");
     #Run get_deps again, to get dependancies minus the blocked packages 
@@ -284,7 +292,8 @@ sub do_host
     #      print("REPORT IGNORE: key: $key val: $val\n");
     #   }
     %warn_List = de_ref_($warnMaster_ref,"hash");
-    print(" - done.\n");
+
+    print(" - \x1b[0;32mdone\x1b[39;49m.\n");
     
     print("Writing out databases");
     #Write out the package dependancy list to flat text file (package.dep)
@@ -307,7 +316,7 @@ sub do_host
     {
         print("Creating Debian status file");
         build_deb_status(@include_List);
-        print(" - done.\n");
+        print(" - \x1b[0;32mdone\x1b[39;49m.\n");
     }
     elsif($gtcfg_val_{redhat_rpmdb} eq "yes" && $pkgType eq "rpm" && $pkgsChanged)
     {
@@ -320,7 +329,7 @@ sub do_host
     
     write_excldb();
     write_execdb();
-    
+
     if(!$options{L} && !$options{b})
     {
         create_linktree();
@@ -364,11 +373,14 @@ sub do_help
           $T."-n".$D."perform a dryrun; does not change anything (recommended)\n" .
           $T."-h".$D."<fqdn> (fully qualified domain name)\n" .
           $T."-c".$D."turn on 128 bit MD5 checksumming (will go slower)\n" .
+          $T."-d".$D."show debugging info\n" .
           $T."-v".$D."turn on extra verbosity\n" .
+          "\n" .
           $T."-l".$D."build linktree only, do not run rsync\n" .
           $T."-L".$D."don't rebuild linktree, this is dangerous in some circumstances\n" .
           $T."-m".$D."<email> send report to email address. (useful in conjuction with -n)\n" .
           $T."-g".$D."GT a group of machines.\n" .
+          $T."-G".$D."???????????????????????\n" .
           $T."-R".$D."removes the package.db of the host and starts from fresh\n" .
           $T."-P".$D."use alternate port with ssh (default is 22)\n" .
           $T."-C".$D."read alternate config file\n" .
@@ -403,13 +415,14 @@ sub do_link_hostfiles
     }
     else
     {
-        print(" - done.\n");
+        print(" - \x1b[0;32mdone\x1b[39;49m.\n");
     }
 }
 
 sub get_finalhostlist
 {
     my(@group_hosts,@final_hostlist,%unique_list,@unique_final_list);
+    my $exit_early=0;
     
     #Grab list from -h option
     my @host_list = split(/,/, $options{h});
@@ -421,9 +434,22 @@ sub get_finalhostlist
         }
         else
         {
-            die("Host $_ does not exist!\n");
+            $exit_early=1;
+            last;
         }
     }
+
+    if($exit_early == 1) {
+        my @host_list = split(/,/, $options{h});
+        #foreach $host (@host_list) {
+        foreach(@host_list) {
+            print(".");
+            #print("$host\n");
+        }
+        die("Host $_ does not exist!\n");
+    }
+
+
     
     #Get list of groups
     my @group_list = split(/,/, $options{g});
@@ -546,7 +572,7 @@ sub delete_linktree
     my $count = 0;
     my @art = ("-","\\","|","/");
     #Could use some verification
-    print("Deleting linktree");
+    print("\x1b[0;35mDeleting linktree\x1b[39;49m");
     if($options{v})
     {
         open(RM, "$cli_Util{'rm'} -rvf $gtcfg_val_{treedir}/$options{h}|") || die("Cannot open $cli_Util{'rm'}. Reason: $!\n");
@@ -571,7 +597,7 @@ sub delete_linktree
     {
         system("$cli_Util{'rm'} -rf $gtcfg_val_{treedir}/$options{h}");
     }
-    print(" - done.\n");
+    print(" - \x1b[0;32mdone\x1b[39;49m.\n");
 }
 
 sub parse_hostconf
@@ -947,7 +973,7 @@ sub create_linktree
         linkpackage($key,$val,$parpack);
     }
     
-    print(" - done.\n");
+    print(" - \x1b[0;32mdone\x1b[39;49m.\n");
     untie(%pkgdb);
 }
 
@@ -1467,10 +1493,27 @@ sub rsync_host
     
     open(RSYNC, "$cli_Util{'rsync'} $rsync_flags -e \"$cli_Util{'ssh'} -p$options{P}\" -i --delete $rsync_string $gtcfg_val_{treedir}/$options{h}/  $options{h}:/|") || die "\n\nCannot open $cli_Util{'rsync'}. Reason: $!\n";
     write_log_("rsync.log","$cli_Util{'rsync'} $rsync_flags -e \"$cli_Util{'ssh'} -p$options{P}\" -i --delete $rsync_string $gtcfg_val_{treedir}/$options{h}/  $options{h}:/\n");
-    
+
     my(%excluding,@deleting,@updated,@warnings);
+    if($options{v}) {
+        print("\x1b[0;33m\n"); # set text color to amber
+    }
+    my $c=0;
     while(<RSYNC>)
     {
+        # print a yellow spinning bar
+        if($options{v}) {
+            if ($c%4 == 0) {
+                print("\b|");
+            } elsif ($c%4 == 1) {
+                print("\b/");
+            } elsif ($c%4 == 2) {
+                print("\b-");
+            } elsif ($c%4 == 3) {
+                print("\b\\");
+            }
+            $c++;
+        }
         chomp $_;
         if($options{d})
         {
@@ -1523,13 +1566,13 @@ sub rsync_host
 	          {
                 next;
             }
-            
         }
     }
+    if($options{v}) {
+        print("\b\b\x1b[39;49m\n"); # return text color to white
+    }
     close(RSYNC);
-    
-    print("- complete.\n");
-    
+    print("- \x1b[0;32mcomplete.\x1b[39;49m\n");
     # Create exclude.txt and run the backup rsync
     my(@backedup,@b_uptodate,@b_deleting);
     if($options{b})
@@ -1627,7 +1670,7 @@ sub rsync_host
             }
         }
         close(RSYNC);
-        print("- complete.\n");
+        print("- \x1b[0;32mcomplete.\x1b[39;49m.\n");
         
         print("Examining backup directory - ");
         examine_backup_dir(@backup_info);
@@ -1744,7 +1787,7 @@ sub rsync_host
     
     close(GTREPORT);
     
-    print("- done.\n");
+    print("- \x1b[0;32mdone\x1b[39;49m.\n");
     
     return($fileschanged);
 }
@@ -2196,7 +2239,7 @@ sub build_rpm_status
     }
     close(TMPSTAT);
     
-    print(" - done.");
+    print(" - \x1b[0;32mdone\x1b[39;49m.");
     
     build_rpm_db();
 }
@@ -2248,14 +2291,14 @@ sub build_rpm_db
         system("$cli_Util{'ln'} $_ $gtcfg_val_{dbdir}/$options{h}/rpms");
     }
     close(FIND);
-    print("- done.");
+    print("- \x1b[0;32mdone\x1b[39;49m.");
     
     print(" / Rebuilding rpm database ");
     system("$cli_Util{'rpm'} --quiet --dbpath $gtcfg_val_{dbdir}/$options{h}/rpmdb --justdb --nodeps --force -i $gtcfg_val_{dbdir}/$options{h}/rpms/*.rpm 2> /dev/null");   
     
     system("$cli_Util{'mkdir'} -p $avail_hosts_{$options{h}}/files/var/lib/rpm");
     system("$cli_Util{'cp'} -a $gtcfg_val_{dbdir}/$options{h}/rpmdb/* $avail_hosts_{$options{h}}/files/var/lib/rpm");
-    print("- done.\n");
+    print("- \x1b[0;32mdone\x1b[39;49m.\n");
 }
 
 sub cp_debian_status
